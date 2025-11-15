@@ -1,340 +1,220 @@
-import io
-import re
-from typing import Dict, Any, List
-
-import numpy as np
 import pandas as pd
+import numpy as np
+from io import BytesIO
 
-
-# ============================
-#       UTIL FUNCTIONS
-# ============================
-
-def _read_statement(file_bytes: bytes, filename: str) -> pd.DataFrame:
-    """Read CSV or XLSX into a DataFrame."""
-    buf = io.BytesIO(file_bytes)
-    if filename.lower().endswith((".xlsx", ".xls")):
-        df = pd.read_excel(buf)
+def analyze_statement(file_bytes, file_name):
+    # -----------------------------
+    # 1. LOAD FILE
+    # -----------------------------
+    if file_name.lower().endswith(".csv"):
+        df = pd.read_csv(BytesIO(file_bytes))
     else:
-        df = pd.read_csv(buf)
+        df = pd.read_excel(BytesIO(file_bytes))
 
-    df.columns = [str(c).strip() for c in df.columns]
-    return df
+    # -----------------------------
+    # 2. STANDARDIZE COLUMNS
+    # -----------------------------
+    df.columns = df.columns.str.strip().str.lower()
 
+    # Required minimal mapping
+    col_map = {}
+    for c in df.columns:
+        if "date" in c:
+            col_map["date"] = c
+        if "desc" in c:
+            col_map["description"] = c
+        if "amount" in c:
+            col_map["amount"] = c
+        if "type" in c:
+            col_map["type"] = c
 
-def _find_column(df: pd.DataFrame, candidates: List[str]) -> str | None:
-    """Find a column by matching lowercase names."""
-    lower_map = {c.lower(): c for c in df.columns}
-    for cand in candidates:
-        if cand.lower() in lower_map:
-            return lower_map[cand.lower()]
-    return None
+    df = df.rename(columns=col_map)
 
+    # Ensure existence
+    if "date" not in df or "description" not in df or "amount" not in df:
+        raise Exception("Missing required columns (Date, Description, Amount).")
 
-def _ensure_date(df: pd.DataFrame) -> pd.DataFrame:
-    col = _find_column(df, ["Date", "Txn Date", "Transaction Date"])
-    if col is None:
-        raise ValueError("Date column not found. Expected: Date / Txn Date / Transaction Date.")
+    # -----------------------------
+    # 3. CLEAN DATE + AMOUNT
+    # -----------------------------
+    df["date"] = pd.to_datetime(df["date"], dayfirst=True, errors="coerce")
 
-    df["Date"] = pd.to_datetime(df[col], errors="coerce", dayfirst=True)
-    df = df.dropna(subset=["Date"]).copy()
-    return df
-
-
-def _ensure_description(df: pd.DataFrame) -> pd.DataFrame:
-    col = _find_column(df, ["Description", "Narration", "Transaction Details"])
-    if col is None:
-        raise ValueError("Description column not found.")
-    df["Description"] = df[col].astype(str)
-    return df
-
-
-# ============================
-#   SIGNED AMOUNT LOGIC
-# ============================
-
-def _build_signed_amount(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compute SignedAmount:
-    + positive = credit
-    + negative = debit
-    Priority order:
-    1. Amount + Type (CR/DR)
-    2. Credit + Debit columns
-    3. Existing SignedAmount
-    """
-
-    # ---- Option A: Amount + Type (CR/DR) ----
-    amt_col = _find_column(df, ["Amount", "Amt"])
-    type_col = _find_column(df, ["Type", "DR/CR", "CR/DR"])
-
-    if amt_col is not None and type_col is not None:
-        df[amt_col] = pd.to_numeric(df[amt_col], errors="coerce")
-        df = df.dropna(subset=[amt_col]).copy()
-
-        types = df[type_col].astype(str).str.lower().str.strip()
-        credit_markers = {"cr", "credit", "c", "in"}
-
-        df["SignedAmount"] = np.where(
-            types.isin(credit_markers),
-            df[amt_col],
-            -abs(df[amt_col]),
-        )
-        return df
-
-    # ---- Option B: Credit & Debit columns ----
-    credit_col = _find_column(df, ["Credit", "Cr", "Cr Amount"])
-    debit_col = _find_column(df, ["Debit", "Dr", "Dr Amount"])
-
-    if credit_col is not None and debit_col is not None:
-        df[credit_col] = pd.to_numeric(df[credit_col], errors="coerce").fillna(0)
-        df[debit_col] = pd.to_numeric(df[debit_col], errors="coerce").fillna(0)
-        df["SignedAmount"] = df[credit_col] - df[debit_col]
-        return df
-
-    # ---- Option C: Already has SignedAmount ----
-    if "SignedAmount" in df.columns:
-        df["SignedAmount"] = pd.to_numeric(df["SignedAmount"], errors="coerce")
-        df = df.dropna(subset=["SignedAmount"]).copy()
-        return df
-
-    raise ValueError("Could not compute SignedAmount. Upload contains unsupported columns.")
-
-
-# ============================
-#     CATEGORY DETECTION
-# ============================
-
-def _categorise(desc: str) -> str:
-    d = desc.lower()
-
-    if "salary" in d: return "Salary"
-    if "interest" in d: return "Interest"
-    if "rent" in d and "credit" not in d: return "Rent"
-    if "emi" in d or "loan" in d: return "EMI"
-    if "petrol" in d or "hpcl" in d or "bpcl" in d or "uber" in d or "ola" in d: return "Fuel & Transport"
-    if "airtel" in d or "jio" in d or "vi " in d or "internet" in d or "recharge" in d: return "Mobile & Internet"
-    if "netflix" in d or "prime video" in d or "hotstar" in d or "subscription" in d: return "Subscriptions"
-    if "swiggy" in d or "zomato" in d or "lunch" in d or "dinner" in d or "breakfast" in d: return "Food & Dining"
-    if "amazon" in d or "flipkart" in d or "myntra" in d: return "Shopping"
-    if "school fee" in d or "school fees" in d or "tuition" in d: return "Education"
-    if "upi" in d: return "UPI / Wallet"
-    return "Others"
-
-
-# ============================
-#   UPI COUNTERPARTY FIX
-# ============================
-
-def _upi_counterparty(desc: str) -> str:
-    """
-    Extract counterparty from ANY UPI format:
-    - Upi_Zomato Lunch
-    - UPI-Petrol HPCL
-    - BHIMUPI*1234*
-    - GPay_UPI Zomato
-    """
-    d = desc.lower()
-
-    if "upi" not in d:
-        return desc[:40]
-
-    # Very flexible split pattern
-    parts = re.split(r"(?i)upi[\W_]*", desc, maxsplit=1)
-
-    if len(parts) == 2:
-        after = parts[1].strip()
-        words = after.split()
-        if words:
-            return " ".join(words[:3]).title()
-
-    return desc[:40]
-
-
-# ============================
-#      MAIN ANALYSIS
-# ============================
-
-def analyze_statement(file_bytes: bytes, filename: str) -> Dict[str, Any]:
-    df = _read_statement(file_bytes, filename)
-    df = _ensure_date(df)
-    df = _ensure_description(df)
-    df = _build_signed_amount(df)
-
-    df["Category"] = df["Description"].apply(_categorise)
-    df["Month"] = df["Date"].dt.to_period("M").astype(str)
-
-    # ===================================
-    #        SUMMARY NUMBERS
-    # ===================================
-    inflow = df.loc[df["SignedAmount"] > 0, "SignedAmount"].sum()
-    outflow = -df.loc[df["SignedAmount"] < 0, "SignedAmount"].sum()
-    savings_total = df["SignedAmount"].sum()
-
-    monthly = (
-        df.groupby("Month")
-        .agg(
-            TotalInflow=("SignedAmount", lambda s: s[s > 0].sum()),
-            TotalOutflow=("SignedAmount", lambda s: -s[s < 0].sum()),
-        )
-        .reset_index()
+    # if CSV has commas or ₹ symbol
+    df["amount"] = (
+        df["amount"]
+        .astype(str)
+        .str.replace(",", "", regex=False)
+        .str.replace("₹", "", regex=False)
     )
-    monthly["Savings"] = monthly["TotalInflow"] - monthly["TotalOutflow"]
 
-    monthly_records = [
-        {
-            "Month": row["Month"],
-            "TotalInflow": float(row["TotalInflow"]),
-            "TotalOutflow": float(row["TotalOutflow"]),
-            "Savings": float(row["Savings"]),
+    df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
+
+    # Apply CR/DR correction if provided
+    if "type" in df.columns:
+        df["type"] = df["type"].astype(str).str.upper()
+        df["signed_amount"] = df.apply(
+            lambda row: row["amount"] if row["type"] == "CR" else -abs(row["amount"]),
+            axis=1
+        )
+    else:
+        # If no type column exists, assume negative values are outflow
+        df["signed_amount"] = df["amount"]
+
+    # Remove invalid rows
+    df = df.dropna(subset=["date", "signed_amount"])
+
+    # Sort properly
+    df = df.sort_values("date")
+
+    # -----------------------------
+    # 4. CATEGORY MAPPING
+    # -----------------------------
+    def detect_category(desc):
+        d = desc.lower()
+
+        mapping = {
+            "salary": ["salary"],
+            "rent": ["rent"],
+            "shopping": ["amazon", "flipkart", "myntra", "purchase"],
+            "food & dining": ["swiggy", "zomato", "breakfast", "lunch", "dinner"],
+            "fuel & transport": ["petrol", "hpcl", "bpcl", "fuel", "uber", "ola"],
+            "mobile & internet": ["airtel", "postpaid", "internet", "recharge"],
+            "subscriptions": ["netflix", "hotstar", "prime video"],
+            "emi": ["emi", "loan"],
+            "medical": ["medical", "pharmacy", "hospital"],
         }
-        for _, row in monthly.iterrows()
-    ]
 
-    current_month = None
-    if not df.empty:
-        current_month = df["Date"].max().to_period("M").strftime("%Y-%m")
+        for cat, keys in mapping.items():
+            if any(k in d for k in keys):
+                return cat.capitalize()
 
-    # Growth text
-    if len(monthly_records) >= 2:
-        last = monthly_records[-1]["Savings"]
-        prev = monthly_records[-2]["Savings"]
-        base = prev if prev != 0 else 1
-        pct = (last - prev) / abs(base) * 100
-        sign = "+" if pct >= 0 else ""
-        growth_text = f"{sign}{pct:.0f}% vs last month"
-    else:
-        growth_text = "First month tracked"
+        return "Others"
 
-    safe_daily_spend = max((savings_total / max(len(monthly_records), 1)) / 30, 0)
+    df["category"] = df["description"].astype(str).apply(detect_category)
 
-    # ===================================
-    #         CATEGORY SPEND
-    # ===================================
-    spend = df[df["SignedAmount"] < 0]
-    cat = (
-        spend.groupby("Category", as_index=False)["SignedAmount"]
-        .sum()
+    # -----------------------------
+    # 5. AGGREGATES
+    # -----------------------------
+    df["month"] = df["date"].dt.to_period("M")
+
+    # TOTAL INFLOW / OUTFLOW
+    inflow = df[df["signed_amount"] > 0]["signed_amount"].sum()
+    outflow = df[df["signed_amount"] < 0]["signed_amount"].abs().sum()
+    net_savings = inflow - outflow
+
+    # -----------------------------
+    # 6. MONTHLY SAVINGS
+    # -----------------------------
+    monthly = (
+        df.groupby("month")["signed_amount"].sum().reset_index()
     )
-    cat["TotalAmount"] = cat["SignedAmount"].abs()
-    categories = [
-        {"Category": r["Category"], "TotalAmount": float(r["TotalAmount"])}
-        for _, r in cat.iterrows()
-    ]
+    monthly["month"] = monthly["month"].astype(str)
 
-    # ===================================
-    #        UPI ANALYSIS (FIXED)
-    # ===================================
-    upi_mask = df["Description"].str.contains(r"(?i)upi", regex=True, na=False)
-    upi_df = df[upi_mask].copy()
+    # Latest month
+    latest_month = df["month"].max()
+    latest_month_str = str(latest_month)
 
-    upi_outflow_month = 0.0
-    upi_tops = []
+    this_month_df = df[df["month"] == latest_month]
+    this_month_savings = this_month_df["signed_amount"].sum()
 
-    if not upi_df.empty:
-        upi_df["UPILabel"] = upi_df["Description"].apply(_upi_counterparty)
-        upi_df["Month"] = upi_df["Date"].dt.to_period("M").astype(str)
+    # Compare to previous month
+    prev_month = (latest_month - 1)
+    if prev_month in df["month"].unique():
+        prev_savings = df[df["month"] == prev_month]["signed_amount"].sum()
+        mom_change = this_month_savings - prev_savings
+    else:
+        prev_savings = 0
+        mom_change = 0
 
-        if current_month:
-            cur = upi_df[(upi_df["Month"] == current_month) & (upi_df["SignedAmount"] < 0)]
-            upi_outflow_month = float(-cur["SignedAmount"].sum())
+    # -----------------------------
+    # 7. UPI OUTFLOW
+    # -----------------------------
+    upi_mask = df["description"].str.lower().str.contains("upi")
+    upi_df = df[(upi_mask) & (df["signed_amount"] < 0)]
+    upi_total = upi_df["signed_amount"].abs().sum()
 
-        top = (
-            upi_df[upi_df["SignedAmount"] < 0]
-            .groupby("UPILabel", as_index=False)["SignedAmount"]
+    # Latest month UPI
+    upi_month_df = upi_df[upi_df["month"] == latest_month]
+    upi_month_total = upi_month_df["signed_amount"].abs().sum()
+
+    if not upi_month_df.empty:
+        top_upi_handle = (
+            upi_month_df.groupby("description")["signed_amount"]
             .sum()
+            .abs()
+            .sort_values(ascending=False)
+            .index[0]
         )
-        top["TotalAmount"] = top["SignedAmount"].abs()
-        top = top.sort_values("TotalAmount", ascending=False).head(5)
+    else:
+        top_upi_handle = None
 
-        for _, row in top.iterrows():
-            upi_tops.append({
-                "Description": row["UPILabel"],
-                "TotalAmount": float(row["TotalAmount"]),
-            })
+    # -----------------------------
+    # 8. EMI LOAD
+    # -----------------------------
+    emi_df = df[df["category"] == "Emi"]
+    emi_month_df = emi_df[emi_df["month"] == latest_month]
 
-    # ===================================
-    #          EMI ANALYSIS
-    # ===================================
-    emi_df = df[df["Description"].str.contains("emi", case=False, na=False)]
-    emi_df = emi_df[emi_df["SignedAmount"] < 0].copy()
+    emi_load = emi_month_df["signed_amount"].abs().sum()
+    emi_months = emi_df["month"].nunique()
 
-    emi_load = 0.0
-    emi_by_desc = []
-    emi_by_month = []
+    # -----------------------------
+    # 9. CATEGORY SUMMARY (DONUT)
+    # -----------------------------
+    cat_summary = (
+        df[df["signed_amount"] < 0]
+        .groupby("category")["signed_amount"]
+        .sum()
+        .abs()
+        .reset_index()
+    ).sort_values("signed_amount", ascending=False)
 
-    if not emi_df.empty:
-        # By description
-        d = (
-            emi_df.groupby("Description", as_index=False)["SignedAmount"]
-            .sum()
-        )
-        d["TotalEMI"] = d["SignedAmount"].abs()
-        emi_by_desc = [
-            {"Description": r["Description"], "TotalEMI": float(r["TotalEMI"])}
-            for _, r in d.iterrows()
-        ]
+    # -----------------------------
+    # 10. SAFE DAILY SPEND
+    # -----------------------------
+    # safe spend = (this month savings) / 30 (if positive)
+    safe_daily = max(0, this_month_savings) / 30
 
-        # By month
-        emi_df["Month"] = emi_df["Date"].dt.to_period("M").astype(str)
-        m = (
-            emi_df.groupby("Month", as_index=False)["SignedAmount"]
-            .sum()
-        )
-        m["TotalEMI"] = m["SignedAmount"].abs()
+    # -----------------------------
+    # 11. CLEANED CSV EXPORT
+    # -----------------------------
+    cleaned_export = df[["date", "description", "signed_amount", "category"]].copy()
+    cleaned_export["date"] = cleaned_export["date"].astype(str)
 
-        emi_by_month = [
-            {"Month": r["Month"], "TotalEMI": float(r["TotalEMI"])}
-            for _, r in m.iterrows()
-        ]
+    csv_output = cleaned_export.to_csv(index=False)
 
-        if current_month:
-            row = m[m["Month"] == current_month]
-            if not row.empty:
-                emi_load = float(row["TotalEMI"].iloc[0])
+    # -----------------------------
+    # 12. BUILD RESULT JSON
+    # -----------------------------
+    result = {
+        "summary": {
+            "inflow": inflow,
+            "outflow": outflow,
+            "net_savings": net_savings,
+            "this_month": {
+                "month": latest_month_str,
+                "savings": this_month_savings,
+                "prev_savings": prev_savings,
+                "mom_change": mom_change
+            },
+            "safe_daily_spend": safe_daily
+        },
 
-    # ===================================
-    #         FORECAST LOGIC
-    # ===================================
-    forecast = {"available": False}
-    if len(monthly_records) >= 3:
-        last3 = [m["Savings"] for m in monthly_records[-3:]]
-        forecast.update({
-            "available": True,
-            "next_month": float(sum(last3) / 3),
-            "history": [{"month": m["Month"], "savings": m["Savings"]} for m in monthly_records]
-        })
+        "upi": {
+            "this_month": upi_month_total,
+            "top_handle": top_upi_handle,
+            "total_upi": upi_total
+        },
 
-    # ===================================
-    #       CLEANED EXPORT
-    # ===================================
-    cleaned = df[["Date", "Description", "SignedAmount", "Category"]].copy()
-    cleaned["Date"] = cleaned["Date"].dt.strftime("%Y-%m-%d")
-    cleaned_preview = cleaned.sort_values("Date", ascending=False).head(100)
-    cleaned_csv_bytes = cleaned.to_csv(index=False).encode("utf-8")
+        "emi": {
+            "this_month": emi_load,
+            "months_tracked": emi_months
+        },
 
-    # ===================================
-    #        FINAL RESULT DICT
-    # ===================================
-    summary = {
-        "total_inflow": float(inflow),
-        "total_outflow": float(outflow),
-        "savings_total": float(savings_total),
-        "current_month": current_month,
-        "current_month_savings": float(monthly_records[-1]["Savings"] if monthly_records else 0),
-        "growth_text": growth_text,
-        "upi_net_outflow": float(upi_outflow_month),
-        "emi_load": float(emi_load),
-        "safe_daily_spend": float(safe_daily_spend),
+        "monthly_savings": monthly.to_dict(orient="records"),
+
+        "category_summary": cat_summary.to_dict(orient="records"),
+
+        "cleaned_csv": csv_output
     }
 
-    return {
-        "summary": summary,
-        "monthly": monthly_records,
-        "categories": categories,
-        "upi": {"top_counterparties": upi_tops},
-        "emi": {"by_desc": emi_by_desc, "by_month": emi_by_month},
-        "forecast": forecast,
-        "cleaned_preview": cleaned_preview.to_dict(orient="records"),
-        "cleaned_csv": cleaned_csv_bytes,
-    }
+    return result
