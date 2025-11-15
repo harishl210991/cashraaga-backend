@@ -178,17 +178,31 @@ def _categorise(desc: str) -> str:
 
 
 def _upi_counterparty(desc: str) -> str:
-    """Try to extract a short UPI counterparty label."""
+    """
+    Extract readable UPI counterparty from ANY UPI string.
+    Handles:
+    - UPI
+    - upi
+    - Upi
+    - UPI_ / UPI- / UPI. / UPI*
+    - BHIMUPI / GPayUPI etc.
+    """
     d = desc.lower()
-    if "upi" in d:
-        # e.g. "Upi_Zomato Lunch" -> "Zomato Lunch"
-        parts = re.split(r"upi[_\-\s]+", d, maxsplit=1)
-        if len(parts) == 2:
-            words = parts[1].split()
-            if words:
-                return " ".join(words[:2]).title()
-    return desc[:40]
 
+    # Match any UPI-like pattern
+    if "upi" not in d:
+        return desc[:40]
+
+    # Split using extremely flexible UPI pattern
+    parts = re.split(r"(?i)upi[\W_]*", desc, maxsplit=1)
+
+    if len(parts) == 2:
+        after = parts[1].strip()
+        words = after.split()
+        if words:
+            return " ".join(words[:3]).title()  # take first 3 words
+    
+    return desc[:40]
 
 # =========================
 #   MAIN ANALYSIS
@@ -288,7 +302,7 @@ def analyze_statement(file_bytes: bytes, filename: str) -> Dict[str, Any]:
     # ======================
     #   UPI ANALYSIS
     # ======================
-    upi_mask = df["Description"].str.contains("upi", case=False, na=False)
+    upi_mask = df["Description"].str.contains(r"(?i)upi", regex=True, na=False)
     upi_df = df[upi_mask].copy()
 
     upi_net_outflow_month = 0.0
