@@ -10,6 +10,9 @@ except ImportError:
     LinearRegression = None
 
 
+# =========================
+# FUTURE / PREDICTION BLOCK
+# =========================
 def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
     """
     Prediction block based on current month progression + simple ML model.
@@ -43,9 +46,7 @@ def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
     if "category" not in df.columns:
         df["category"] = "Others"
 
-    # -----------------------------
-    # 1. Identify current & previous months
-    # -----------------------------
+    # 1. Current / previous month split
     current_month = df["month"].max()
     if pd.isna(current_month):
         return {
@@ -72,15 +73,9 @@ def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
     days_in_month = calendar.monthrange(year, month)[1]
     days_elapsed = last_date.day
 
-    # -----------------------------
-    # 2. Project end-of-month savings (baseline)
-    # -----------------------------
-    inflow_to_date = df_current[df_current["signed_amount"] > 0][
-        "signed_amount"
-    ].sum()
-    outflow_to_date = -df_current[df_current["signed_amount"] < 0][
-        "signed_amount"
-    ].sum()
+    # 2. Baseline end-of-month projection
+    inflow_to_date = df_current[df_current["signed_amount"] > 0]["signed_amount"].sum()
+    outflow_to_date = -df_current[df_current["signed_amount"] < 0]["signed_amount"].sum()
 
     avg_daily_inflow = inflow_to_date / max(days_elapsed, 1)
     avg_daily_outflow = outflow_to_date / max(days_elapsed, 1)
@@ -88,21 +83,14 @@ def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
     projected_inflow = avg_daily_inflow * days_in_month
     projected_outflow = avg_daily_outflow * days_in_month
 
-    # Start with pure projection
     predicted_eom_savings = float(projected_inflow - projected_outflow)
 
-    # -----------------------------
-    # 2b. ML refinement using past months (if sklearn is available)
-    # -----------------------------
+    # 2b. ML refinement (if sklearn available)
     if LinearRegression is not None:
         monthly_ml = (
             df.assign(
-                inflow=lambda x: x["signed_amount"].where(
-                    x["signed_amount"] > 0, 0.0
-                ),
-                outflow=lambda x: x["signed_amount"].where(
-                    x["signed_amount"] < 0, 0.0
-                ),
+                inflow=lambda x: x["signed_amount"].where(x["signed_amount"] > 0, 0.0),
+                outflow=lambda x: x["signed_amount"].where(x["signed_amount"] < 0, 0.0),
             )
             .groupby("month")
             .agg(
@@ -126,15 +114,14 @@ def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
                 y_pred = model.predict(X_new)[0]
                 predicted_eom_savings = float(y_pred)
             except Exception:
+                # fall back to heuristic value
                 pass
 
-    # Simple confidence band: ±15%
+    # Confidence band ±15%
     low_bound = float(predicted_eom_savings * 0.85)
     high_bound = float(predicted_eom_savings * 1.15)
 
-    # -----------------------------
     # 3. Overspend risk vs safe_daily_spend / history
-    # -----------------------------
     monthly_net = (
         df.groupby("month")["signed_amount"]
         .sum()
@@ -172,14 +159,9 @@ def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
     else:
         level = "high"
 
-    overspend_risk = {
-        "level": level,
-        "probability": overspend_prob,
-    }
+    overspend_risk = {"level": level, "probability": overspend_prob}
 
-    # -----------------------------
-    # 4. Risky categories (where you may overspend)
-    # -----------------------------
+    # 4. Risky categories
     if df_prev.empty:
         risky_categories = []
     else:
@@ -193,9 +175,7 @@ def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
             .rename("total_outflow_prev")
             .reset_index()
         )
-        prev_cat["baseline_outflow"] = (
-            prev_cat["total_outflow_prev"] / prev_months_count
-        )
+        prev_cat["baseline_outflow"] = prev_cat["total_outflow_prev"] / prev_months_count
 
         curr_cat = (
             df_current[df_current["signed_amount"] < 0]
@@ -244,6 +224,9 @@ def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
     }
 
 
+# ===================
+# HEADER DETECTION
+# ===================
 def _looks_like_header(row: pd.Series) -> bool:
     """Heuristic to detect the real header row in Excel exports."""
     vals = [str(v).strip().lower() for v in row.tolist()]
@@ -259,6 +242,9 @@ def _looks_like_header(row: pd.Series) -> bool:
     return has_date and has_desc and has_amt
 
 
+# ===================
+# MAIN ANALYSIS
+# ===================
 def analyze_statement(file_bytes, file_name):
     name = file_name.lower()
 
@@ -279,7 +265,6 @@ def analyze_statement(file_bytes, file_name):
             df = pd.DataFrame(data_rows, columns=[h.strip() for h in header])
 
     elif name.endswith(".xlsx"):
-        # Always read header=None and detect header row – handles HDFC-style titles
         df_raw = pd.read_excel(BytesIO(file_bytes), header=None)
         header_row_idx = None
         max_scan = min(60, len(df_raw))
@@ -299,7 +284,7 @@ def analyze_statement(file_bytes, file_name):
         df.columns = header
 
     elif name.endswith(".xls"):
-        # Old Excel – needs xlrd installed on the server
+        # old Excel – needs xlrd installed
         df_raw = pd.read_excel(BytesIO(file_bytes), header=None, engine="xlrd")
         header_row_idx = None
         max_scan = min(60, len(df_raw))
@@ -321,65 +306,64 @@ def analyze_statement(file_bytes, file_name):
     else:
         raise Exception("Unsupported file type. Please upload CSV or Excel.")
 
-# -----------------------------
-# 2. STANDARDIZE COLUMNS
-# -----------------------------
-df.columns = df.columns.str.strip().str.lower()
+    # -----------------------------
+    # 2. STANDARDIZE COLUMNS
+    # -----------------------------
+    df.columns = df.columns.str.strip().str.lower()
 
-# Detect core columns
-date_col = next((c for c in df.columns if "date" in c), None)
+    # Detect core columns
+    date_col = next((c for c in df.columns if "date" in c), None)
 
-desc_col = next(
-    (
-        c
-        for c in df.columns
-        if any(
-            k in c
-            for k in ["desc", "narrat", "narration", "particular", "details"]
-        )
-    ),
-    None,
-)
-
-amount_col = next((c for c in df.columns if "amount" in c), None)
-
-# Also look for withdrawal / deposit style columns for banks like HDFC
-debit_col = next(
-    (c for c in df.columns if "withdrawal" in c or "debit" in c), None
-)
-credit_col = next(
-    (c for c in df.columns if "deposit" in c or "credit" in c), None
-)
-
-# If we don't have a single amount column, synthesize from debit/credit/withdrawal/deposit
-if not amount_col and (debit_col or credit_col):
-    df["amount"] = 0.0
-    if debit_col:
-        df["amount"] -= pd.to_numeric(df[debit_col], errors="coerce").fillna(0)
-    if credit_col:
-        df["amount"] += pd.to_numeric(df[credit_col], errors="coerce").fillna(0)
-    amount_col = "amount"
-
-# Final validation
-if not date_col or not desc_col or not amount_col:
-    raise Exception(
-        "Missing required columns (Date, Description, Amount). "
-        f"Found: {list(df.columns)}"
+    desc_col = next(
+        (
+            c
+            for c in df.columns
+            if any(
+                k in c
+                for k in ["desc", "narrat", "narration", "particular", "details"]
+            )
+        ),
+        None,
     )
 
-# Rename to the unified names used later
-rename_map = {
-    date_col: "date",
-    desc_col: "description",
-    amount_col: "amount",
-}
+    amount_col = next((c for c in df.columns if "amount" in c or "amt" in c), None)
 
-# Keep 'type' if present
-type_col = next((c for c in df.columns if "type" in c), None)
-if type_col:
-    rename_map[type_col] = "type"
+    # Also look for withdrawal / deposit style columns for banks like HDFC
+    debit_col = next(
+        (c for c in df.columns if "withdrawal" in c or "debit" in c), None
+    )
+    credit_col = next(
+        (c for c in df.columns if "deposit" in c or "credit" in c), None
+    )
 
-df = df.rename(columns=rename_map)
+    # If we don't have a single amount column, synthesize from debit/credit/withdrawal/deposit
+    if not amount_col and (debit_col or credit_col):
+        df["amount"] = 0.0
+        if debit_col:
+            df["amount"] -= pd.to_numeric(df[debit_col], errors="coerce").fillna(0)
+        if credit_col:
+            df["amount"] += pd.to_numeric(df[credit_col], errors="coerce").fillna(0)
+        amount_col = "amount"
+
+    # Final validation
+    if not date_col or not desc_col or not amount_col:
+        raise Exception(
+            "Missing required columns (Date, Description, Amount). "
+            f"Found: {list(df.columns)}"
+        )
+
+    # Rename to the unified names used later
+    rename_map = {
+        date_col: "date",
+        desc_col: "description",
+        amount_col: "amount",
+    }
+
+    type_col = next((c for c in df.columns if "type" in c), None)
+    if type_col:
+        rename_map[type_col] = "type"
+
+    df = df.rename(columns=rename_map)
 
     # -----------------------------
     # 3. CLEAN DATE + AMOUNT
