@@ -4,3 +4,5 @@ pandas
 pmdarima
 python-multipart
 numpy
+fastapi
+google-generativeai
