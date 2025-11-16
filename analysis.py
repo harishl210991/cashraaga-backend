@@ -1,13 +1,166 @@
-import pandas as pd
-import numpy as np
-from io import BytesIO
+import os
 import calendar
+from io import BytesIO
 
-# Optional ML import – safe fallback if missing
+import joblib
+import numpy as np
+import pandas as pd
+
+# ========= Optional Gemini client for zero-shot classification =========
+try:
+    import google.generativeai as genai
+except ImportError:
+    genai = None
+
+# ========= Optional sklearn for future-block regression =========
 try:
     from sklearn.linear_model import LinearRegression
 except ImportError:
     LinearRegression = None
+
+
+# ========= Category model (local ML) =========
+CATEGORY_MODEL = None
+CATEGORY_LABELS = None
+
+try:
+    CATEGORY_MODEL = joblib.load("category_model.joblib")
+    try:
+        CATEGORY_LABELS = list(CATEGORY_MODEL.classes_)
+    except Exception:
+        CATEGORY_LABELS = None
+except Exception:
+    CATEGORY_MODEL = None
+
+# ========= Gemini config =========
+GEMINI_MODEL_NAME = os.getenv("CASHRAAGA_CATEGORY_MODEL", "gemini-1.5-flash")
+GEMINI_CLIENT = None
+
+if genai is not None:
+    try:
+        api_key = os.getenv("GEMINI_API_KEY")
+        if api_key:
+            genai.configure(api_key=api_key)
+            GEMINI_CLIENT = genai.GenerativeModel(GEMINI_MODEL_NAME)
+    except Exception:
+        GEMINI_CLIENT = None
+
+# Final category list we want the model / LLM to use
+CATEGORY_LIST = [
+    "Salary",
+    "Rent",
+    "EMI",
+    "Food & Dining",
+    "Groceries",
+    "Shopping",
+    "Transfers",
+    "UPI Payment",
+    "Bank Transfer",
+    "Income",
+    "Fuel & Transport",
+    "Mobile & Internet",
+    "Bills & Utilities",
+    "Others",
+]
+
+
+# =========================
+# CATEGORY HELPERS
+# =========================
+def ml_categorize(description: str):
+    """Use local sklearn model if available. Returns label or None."""
+    if CATEGORY_MODEL is None:
+        return None
+
+    try:
+        if hasattr(CATEGORY_MODEL, "predict_proba"):
+            probs = CATEGORY_MODEL.predict_proba([description])[0]
+            labels = getattr(CATEGORY_MODEL, "classes_", None)
+            if labels is None:
+                return str(CATEGORY_MODEL.predict([description])[0])
+            best_idx = int(np.argmax(probs))
+            best_label = str(labels[best_idx])
+            best_prob = float(probs[best_idx])
+            # Only trust predictions with reasonable confidence
+            if best_prob < 0.5:
+                return None
+            return best_label
+        else:
+            return str(CATEGORY_MODEL.predict([description])[0])
+    except Exception:
+        return None
+
+
+def llm_categorize(description: str):
+    """Use Gemini zero-shot classification if configured. Returns label or None."""
+    if GEMINI_CLIENT is None:
+        return None
+
+    prompt = (
+        "You are a strict financial transaction classifier for a personal finance app.\n"
+        "Given the transaction description, choose exactly one category from this list:\n"
+        + ", ".join(CATEGORY_LIST)
+        + "\n\n"
+        f"Description: {description}\n"
+        "Reply with only the category text, nothing else."
+    )
+
+    try:
+        resp = GEMINI_CLIENT.generate_content(prompt)
+        answer = (resp.text or "").strip()
+        # Align to one of our known labels
+        for cat in CATEGORY_LIST:
+            if cat.lower() in answer.lower():
+                return cat
+        return "Others"
+    except Exception:
+        return None
+
+
+def detect_category(description: str) -> str:
+    """
+    Orchestrator:
+    1) Try local ML model
+    2) Try Gemini zero-shot
+    3) Fall back to keyword rules
+    """
+    text = str(description)
+
+    # 1) Local ML
+    label = ml_categorize(text)
+    if label:
+        return label
+
+    # 2) Gemini
+    label = llm_categorize(text)
+    if label:
+        return label
+
+    # 3) Rules
+    d = text.lower()
+
+    if "rent" in d:
+        return "Rent"
+    if any(k in d for k in ["emi", "bajaj", "finserv", "finance ltd"]):
+        return "EMI"
+    if any(k in d for k in ["swiggy", "zomato", "ganga", "hotel", "restaurant"]):
+        return "Food & Dining"
+    if any(k in d for k in ["zepto", "marketplace", "grocer", "mart"]):
+        return "Groceries"
+    if any(k in d for k in ["amazon", "flipkart", "myntra"]):
+        return "Shopping"
+    if any(k in d for k in ["petrol", "fuel", "hpcl", "bpcl"]):
+        return "Fuel & Transport"
+    if any(k in d for k in ["airtel", "jio", "vi", "recharge", "postpaid"]):
+        return "Mobile & Internet"
+    if "salary" in d:
+        return "Salary"
+    if any(k in d for k in ["imps", "neft", "rtgs"]):
+        return "Bank Transfer"
+    if any(k in d for k in ["upi", "ybl", "okicici", "axl"]):
+        return "UPI Payment"
+
+    return "Others"
 
 
 # =========================
@@ -21,16 +174,7 @@ def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
     projected end-of-month savings.
     """
 
-    if df.empty:
-        return {
-            "predicted_eom_savings": 0.0,
-            "predicted_eom_range": [0.0, 0.0],
-            "overspend_risk": {"level": "low", "probability": 0.0},
-            "risky_categories": [],
-        }
-
-    # Ensure we have required fields
-    if "date" not in df.columns or "signed_amount" not in df.columns:
+    if df.empty or "date" not in df.columns or "signed_amount" not in df.columns:
         return {
             "predicted_eom_savings": 0.0,
             "predicted_eom_range": [0.0, 0.0],
@@ -46,7 +190,6 @@ def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
     if "category" not in df.columns:
         df["category"] = "Others"
 
-    # 1. Current / previous month split
     current_month = df["month"].max()
     if pd.isna(current_month):
         return {
@@ -73,7 +216,6 @@ def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
     days_in_month = calendar.monthrange(year, month)[1]
     days_elapsed = last_date.day
 
-    # 2. Baseline end-of-month projection
     inflow_to_date = df_current[df_current["signed_amount"] > 0]["signed_amount"].sum()
     outflow_to_date = -df_current[df_current["signed_amount"] < 0]["signed_amount"].sum()
 
@@ -85,7 +227,6 @@ def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
 
     predicted_eom_savings = float(projected_inflow - projected_outflow)
 
-    # 2b. ML refinement (if sklearn available)
     if LinearRegression is not None:
         monthly_ml = (
             df.assign(
@@ -95,7 +236,7 @@ def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
             .groupby("month")
             .agg(
                 total_inflow=("inflow", "sum"),
-                total_outflow=("outflow", "sum"),  # negative
+                total_outflow=("outflow", "sum"),
                 net=("signed_amount", "sum"),
             )
             .reset_index()
@@ -105,23 +246,18 @@ def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
         if len(monthly_ml) >= 3:
             X = monthly_ml[["total_inflow", "total_outflow"]].to_numpy()
             y = monthly_ml["net"].to_numpy()
-
             try:
                 model = LinearRegression()
                 model.fit(X, y)
-
                 X_new = np.array([[projected_inflow, -projected_outflow]])
                 y_pred = model.predict(X_new)[0]
                 predicted_eom_savings = float(y_pred)
             except Exception:
-                # fall back to heuristic value
                 pass
 
-    # Confidence band ±15%
     low_bound = float(predicted_eom_savings * 0.85)
     high_bound = float(predicted_eom_savings * 1.15)
 
-    # 3. Overspend risk vs safe_daily_spend / history
     monthly_net = (
         df.groupby("month")["signed_amount"]
         .sum()
@@ -161,7 +297,6 @@ def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
 
     overspend_risk = {"level": level, "probability": overspend_prob}
 
-    # 4. Risky categories
     if df_prev.empty:
         risky_categories = []
     else:
@@ -228,17 +363,12 @@ def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
 # HEADER DETECTION
 # ===================
 def _looks_like_header(row: pd.Series) -> bool:
-    """Heuristic to detect the real header row in Excel exports."""
     vals = [str(v).strip().lower() for v in row.tolist()]
-
     has_date = any("date" in v for v in vals)
-
     desc_keys = ["desc", "narrat", "narration", "particular", "details"]
     has_desc = any(any(k in v for k in desc_keys) for v in vals)
-
     amt_keys = ["amount", "amt", "withdrawal", "deposit", "debit", "credit"]
     has_amt = any(any(k in v for k in amt_keys) for v in vals)
-
     return has_date and has_desc and has_amt
 
 
@@ -248,19 +378,14 @@ def _looks_like_header(row: pd.Series) -> bool:
 def analyze_statement(file_bytes, file_name):
     name = file_name.lower()
 
-    # -----------------------------
     # 1. LOAD FILE
-    # -----------------------------
     if name.endswith(".csv"):
         df = pd.read_csv(BytesIO(file_bytes))
-
-        # CSV rescue: case where everything is quoted into one column
         if df.shape[1] == 1 and "," in str(df.columns[0]):
             text = file_bytes.decode("utf-8", errors="ignore")
             lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-            rows = [ln.strip('"') for ln in lines]  # remove wrapping quotes
+            rows = [ln.strip('"') for ln in lines]
             split_rows = [r.split(",") for r in rows]
-
             header, data_rows = split_rows[0], split_rows[1:]
             df = pd.DataFrame(data_rows, columns=[h.strip() for h in header])
 
@@ -272,19 +397,16 @@ def analyze_statement(file_bytes, file_name):
             if _looks_like_header(df_raw.iloc[i]):
                 header_row_idx = i
                 break
-
         if header_row_idx is None:
             raise Exception(
                 "Could not locate header row in Excel. "
                 "Try exporting the statement again as CSV or simpler XLSX."
             )
-
         header = df_raw.iloc[header_row_idx].astype(str).tolist()
         df = df_raw.iloc[header_row_idx + 1 :].copy()
         df.columns = header
 
     elif name.endswith(".xls"):
-        # old Excel – needs xlrd installed
         df_raw = pd.read_excel(BytesIO(file_bytes), header=None, engine="xlrd")
         header_row_idx = None
         max_scan = min(60, len(df_raw))
@@ -292,13 +414,11 @@ def analyze_statement(file_bytes, file_name):
             if _looks_like_header(df_raw.iloc[i]):
                 header_row_idx = i
                 break
-
         if header_row_idx is None:
             raise Exception(
                 "Could not locate header row in .xls file. "
                 "Try exporting the statement again as CSV or XLSX."
             )
-
         header = df_raw.iloc[header_row_idx].astype(str).tolist()
         df = df_raw.iloc[header_row_idx + 1 :].copy()
         df.columns = header
@@ -306,14 +426,10 @@ def analyze_statement(file_bytes, file_name):
     else:
         raise Exception("Unsupported file type. Please upload CSV or Excel.")
 
-    # -----------------------------
     # 2. STANDARDIZE COLUMNS
-    # -----------------------------
     df.columns = df.columns.str.strip().str.lower()
 
-    # Detect core columns
     date_col = next((c for c in df.columns if "date" in c), None)
-
     desc_col = next(
         (
             c
@@ -325,10 +441,8 @@ def analyze_statement(file_bytes, file_name):
         ),
         None,
     )
-
     amount_col = next((c for c in df.columns if "amount" in c or "amt" in c), None)
 
-    # Also look for withdrawal / deposit style columns for banks like HDFC
     debit_col = next(
         (c for c in df.columns if "withdrawal" in c or "debit" in c), None
     )
@@ -336,7 +450,6 @@ def analyze_statement(file_bytes, file_name):
         (c for c in df.columns if "deposit" in c or "credit" in c), None
     )
 
-    # If we don't have a single amount column, synthesize from debit/credit/withdrawal/deposit
     if not amount_col and (debit_col or credit_col):
         df["amount"] = 0.0
         if debit_col:
@@ -345,31 +458,24 @@ def analyze_statement(file_bytes, file_name):
             df["amount"] += pd.to_numeric(df[credit_col], errors="coerce").fillna(0)
         amount_col = "amount"
 
-    # Final validation
     if not date_col or not desc_col or not amount_col:
         raise Exception(
             "Missing required columns (Date, Description, Amount). "
             f"Found: {list(df.columns)}"
         )
 
-    # Rename to the unified names used later
     rename_map = {
         date_col: "date",
         desc_col: "description",
         amount_col: "amount",
     }
-
     type_col = next((c for c in df.columns if "type" in c), None)
     if type_col:
         rename_map[type_col] = "type"
-
     df = df.rename(columns=rename_map)
 
-    # -----------------------------
     # 3. CLEAN DATE + AMOUNT
-    # -----------------------------
     df["date"] = pd.to_datetime(df["date"], dayfirst=True, errors="coerce")
-
     df["amount"] = (
         df["amount"]
         .astype(str)
@@ -378,7 +484,6 @@ def analyze_statement(file_bytes, file_name):
     )
     df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
 
-    # Apply CR/DR correction if provided
     if "type" in df.columns:
         df["type"] = df["type"].astype(str).str.upper()
         df["signed_amount"] = df.apply(
@@ -388,50 +493,19 @@ def analyze_statement(file_bytes, file_name):
     else:
         df["signed_amount"] = df["amount"]
 
-    # Remove invalid rows
     df = df.dropna(subset=["date", "signed_amount"])
-
-    # Sort properly
     df = df.sort_values("date")
 
-    # -----------------------------
-    # 4. CATEGORY MAPPING
-    # -----------------------------
-    def detect_category(desc):
-        d = str(desc).lower()
-
-        mapping = {
-            "salary": ["salary"],
-            "rent": ["rent"],
-            "shopping": ["amazon", "flipkart", "myntra", "purchase"],
-            "food & dining": ["swiggy", "zomato", "breakfast", "lunch", "dinner"],
-            "fuel & transport": ["petrol", "hpcl", "bpcl", "fuel", "uber", "ola"],
-            "mobile & internet": ["airtel", "postpaid", "internet", "recharge"],
-            "subscriptions": ["netflix", "hotstar", "prime video"],
-            "emi": ["emi", "loan"],
-            "medical": ["medical", "pharmacy", "hospital"],
-        }
-
-        for cat, keys in mapping.items():
-            if any(k in d for k in keys):
-                return cat.capitalize()
-
-        return "Others"
-
+    # 4. CATEGORY (ML + Gemini + rules)
     df["category"] = df["description"].astype(str).apply(detect_category)
 
-    # -----------------------------
     # 5. AGGREGATES
-    # -----------------------------
     df["month"] = df["date"].dt.to_period("M")
 
     inflow = df[df["signed_amount"] > 0]["signed_amount"].sum()
     outflow = df[df["signed_amount"] < 0]["signed_amount"].abs().sum()
     net_savings = inflow - outflow
 
-    # -----------------------------
-    # 6. MONTHLY SAVINGS
-    # -----------------------------
     monthly = df.groupby("month")["signed_amount"].sum().reset_index()
     monthly["month"] = monthly["month"].astype(str)
 
@@ -449,9 +523,7 @@ def analyze_statement(file_bytes, file_name):
         prev_savings = 0
         mom_change = 0
 
-    # -----------------------------
     # 7. UPI OUTFLOW
-    # -----------------------------
     upi_mask = df["description"].astype(str).str.lower().str.contains("upi")
     upi_df = df[(upi_mask) & (df["signed_amount"] < 0)]
     upi_total = upi_df["signed_amount"].abs().sum()
@@ -470,18 +542,14 @@ def analyze_statement(file_bytes, file_name):
     else:
         top_upi_handle = None
 
-    # -----------------------------
     # 8. EMI LOAD
-    # -----------------------------
-    emi_df = df[df["category"] == "Emi"]
+    emi_df = df[df["category"] == "EMI"]
     emi_month_df = emi_df[emi_df["month"] == latest_month]
 
     emi_load = emi_month_df["signed_amount"].abs().sum()
     emi_months = emi_df["month"].nunique()
 
-    # -----------------------------
     # 9. CATEGORY SUMMARY (DONUT)
-    # -----------------------------
     cat_summary = (
         df[df["signed_amount"] < 0]
         .groupby("category")["signed_amount"]
@@ -490,27 +558,18 @@ def analyze_statement(file_bytes, file_name):
         .reset_index()
     ).sort_values("signed_amount", ascending=False)
 
-    # -----------------------------
     # 10. SAFE DAILY SPEND
-    # -----------------------------
     safe_daily = max(0, this_month_savings) / 30
 
-    # -----------------------------
     # 11. FUTURE / PREDICTION BLOCK
-    # -----------------------------
     future_block = build_future_block(df, safe_daily)
 
-    # -----------------------------
     # 12. CLEANED CSV EXPORT
-    # -----------------------------
     cleaned_export = df[["date", "description", "signed_amount", "category"]].copy()
     cleaned_export["date"] = cleaned_export["date"].astype(str)
-
     csv_output = cleaned_export.to_csv(index=False)
 
-    # -----------------------------
     # 13. BUILD RESULT JSON
-    # -----------------------------
     result = {
         "summary": {
             "inflow": inflow,
