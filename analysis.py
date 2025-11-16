@@ -189,7 +189,7 @@ def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
         prev_months_count = max(df_prev["month"].nunique(), 1)
 
         prev_cat = (
-            df_prev[df_prev["signed_amount"] < 0]
+            df_prev[df["signed_amount"] < 0]
             .assign(outflow=lambda x: -x["signed_amount"])
             .groupby("category")["outflow"]
             .sum()
@@ -254,6 +254,17 @@ def analyze_statement(file_bytes, file_name):
     # -----------------------------
     if file_name.lower().endswith(".csv"):
         df = pd.read_csv(BytesIO(file_bytes))
+
+        # Handle case like your dummy CSV where everything is quoted
+        # and ends up in a single column: "Date,Description,Amount,Type"
+        if df.shape[1] == 1 and "," in str(df.columns[0]):
+            text = file_bytes.decode("utf-8", errors="ignore")
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            rows = [ln.strip('"') for ln in lines]  # remove wrapping quotes
+            split_rows = [r.split(",") for r in rows]
+
+            header, data_rows = split_rows[0], split_rows[1:]
+            df = pd.DataFrame(data_rows, columns=[h.strip() for h in header])
     else:
         df = pd.read_excel(BytesIO(file_bytes))
 
@@ -262,12 +273,12 @@ def analyze_statement(file_bytes, file_name):
     # -----------------------------
     df.columns = df.columns.str.strip().str.lower()
 
-    # Required minimal mapping
+    # Required minimal mapping (slightly more robust on description)
     col_map = {}
     for c in df.columns:
         if "date" in c:
             col_map["date"] = c
-        if "desc" in c:
+        if "desc" in c or "narrat" in c or "details" in c:
             col_map["description"] = c
         if "amount" in c:
             col_map["amount"] = c
@@ -278,7 +289,9 @@ def analyze_statement(file_bytes, file_name):
 
     # Ensure existence
     if "date" not in df or "description" not in df or "amount" not in df:
-        raise Exception("Missing required columns (Date, Description, Amount).")
+        raise Exception(
+            f"Missing required columns (Date, Description, Amount). Found: {list(df.columns)}"
+        )
 
     # -----------------------------
     # 3. CLEAN DATE + AMOUNT
