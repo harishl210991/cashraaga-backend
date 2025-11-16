@@ -247,18 +247,16 @@ def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
         "risky_categories": risky_categories,
     }
 
-
 def analyze_statement(file_bytes, file_name):
+    name = file_name.lower()
+
     # -----------------------------
     # 1. LOAD FILE
     # -----------------------------
-    name = file_name.lower()
-
     if name.endswith(".csv"):
         df = pd.read_csv(BytesIO(file_bytes))
 
-        # Handle case like your dummy CSV where everything is quoted
-        # and ends up in a single column: "Date,Description,Amount,Type"
+        # CSV rescue: case where everything is quoted into one column
         if df.shape[1] == 1 and "," in str(df.columns[0]):
             text = file_bytes.decode("utf-8", errors="ignore")
             lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
@@ -269,41 +267,101 @@ def analyze_statement(file_bytes, file_name):
             df = pd.DataFrame(data_rows, columns=[h.strip() for h in header])
 
     elif name.endswith(".xlsx"):
-        # Newer Excel files
-        df = pd.read_excel(BytesIO(file_bytes), engine="openpyxl")
+        df = pd.read_excel(BytesIO(file_bytes))  # pandas will use openpyxl
 
     elif name.endswith(".xls"):
-        # Old Excel files – need xlrd
-        try:
-            import xlrd  # noqa: F401
-        except ImportError:
-            raise Exception(
-                "Old .xls Excel files need extra support on the server. "
-                "Install xlrd>=2.0.1 (or export your statement as .csv/.xlsx and upload that)."
-            )
-
+        # old Excel – needs xlrd installed
         df = pd.read_excel(BytesIO(file_bytes), engine="xlrd")
 
     else:
-        raise Exception(
-            "Unsupported file type. Please upload a .csv or .xlsx/.xls bank statement."
+        raise Exception("Unsupported file type. Please upload CSV or Excel.")
+
+    # -----------------------------
+    # 1b. EXCEL RESCUE – FIND REAL HEADER ROW
+    # -----------------------------
+    if name.endswith((".xls", ".xlsx")):
+        cols_lower = [str(c).lower() for c in df.columns]
+
+        has_core_cols = (
+            any("date" in c for c in cols_lower)
+            and (
+                any("desc" in c for c in cols_lower)
+                or any("narrat" in c for c in cols_lower)
+                or any("particular" in c for c in cols_lower)
+            )
+            and (
+                any("amount" in c for c in cols_lower)
+                or any("debit" in c for c in cols_lower)
+                or any("credit" in c for c in cols_lower)
+            )
         )
+
+        # If the first row looks like a title (HDFC style), re-scan file
+        if not has_core_cols:
+            if name.endswith(".xlsx"):
+                df_raw = pd.read_excel(BytesIO(file_bytes), header=None)
+            else:
+                df_raw = pd.read_excel(
+                    BytesIO(file_bytes), header=None, engine="xlrd"
+                )
+
+            header_row_idx = None
+            max_scan = min(40, len(df_raw))  # scan top 40 rows
+
+            for i in range(max_scan):
+                row = df_raw.iloc[i].astype(str).str.lower()
+
+                if (
+                    any("date" in v for v in row)
+                    and (
+                        any("desc" in v for v in row)
+                        or any("narrat" in v for v in row)
+                        or any("particular" in v for v in row)
+                    )
+                    and (
+                        any("amount" in v for v in row)
+                        or any("debit" in v for v in row)
+                        or any("credit" in v for v in row)
+                    )
+                ):
+                    header_row_idx = i
+                    break
+
+            if header_row_idx is not None:
+                header = df_raw.iloc[header_row_idx].astype(str).tolist()
+                df = df_raw.iloc[header_row_idx + 1 :].copy()
+                df.columns = header
+
     # -----------------------------
     # 2. STANDARDIZE COLUMNS
     # -----------------------------
     df.columns = df.columns.str.strip().str.lower()
 
-    # Required minimal mapping (slightly more robust on description)
     col_map = {}
     for c in df.columns:
         if "date" in c:
             col_map["date"] = c
-        if "desc" in c or "narrat" in c or "details" in c:
+        if "desc" in c or "narrat" in c or "details" in c or "particular" in c:
             col_map["description"] = c
         if "amount" in c:
             col_map["amount"] = c
+        if "debit" in c and "amount" not in col_map:
+            # we'll handle debit/credit pair below if needed
+            pass
         if "type" in c:
             col_map["type"] = c
+
+    # If no "amount" column, try to synthesize from debit/credit
+    if "amount" not in col_map:
+        debit_col = next((c for c in df.columns if "debit" in c), None)
+        credit_col = next((c for c in df.columns if "credit" in c), None)
+        if debit_col or credit_col:
+            df["amount"] = 0.0
+            if debit_col:
+                df["amount"] -= pd.to_numeric(df[debit_col], errors="coerce").fillna(0)
+            if credit_col:
+                df["amount"] += pd.to_numeric(df[credit_col], errors="coerce").fillna(0)
+            col_map["amount"] = "amount"
 
     df = df.rename(columns=col_map)
 
@@ -318,14 +376,12 @@ def analyze_statement(file_bytes, file_name):
     # -----------------------------
     df["date"] = pd.to_datetime(df["date"], dayfirst=True, errors="coerce")
 
-    # if CSV has commas or ₹ symbol
     df["amount"] = (
         df["amount"]
         .astype(str)
         .str.replace(",", "", regex=False)
         .str.replace("₹", "", regex=False)
     )
-
     df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
 
     # Apply CR/DR correction if provided
@@ -376,7 +432,6 @@ def analyze_statement(file_bytes, file_name):
     # -----------------------------
     df["month"] = df["date"].dt.to_period("M")
 
-    # TOTAL INFLOW / OUTFLOW
     inflow = df[df["signed_amount"] > 0]["signed_amount"].sum()
     outflow = df[df["signed_amount"] < 0]["signed_amount"].abs().sum()
     net_savings = inflow - outflow
@@ -387,14 +442,12 @@ def analyze_statement(file_bytes, file_name):
     monthly = df.groupby("month")["signed_amount"].sum().reset_index()
     monthly["month"] = monthly["month"].astype(str)
 
-    # Latest month
     latest_month = df["month"].max()
     latest_month_str = str(latest_month)
 
     this_month_df = df[df["month"] == latest_month]
     this_month_savings = this_month_df["signed_amount"].sum()
 
-    # Compare to previous month
     prev_month = latest_month - 1
     if prev_month in df["month"].unique():
         prev_savings = df[df["month"] == prev_month]["signed_amount"].sum()
@@ -410,7 +463,6 @@ def analyze_statement(file_bytes, file_name):
     upi_df = df[(upi_mask) & (df["signed_amount"] < 0)]
     upi_total = upi_df["signed_amount"].abs().sum()
 
-    # Latest month UPI
     upi_month_df = upi_df[upi_df["month"] == latest_month]
     upi_month_total = upi_month_df["signed_amount"].abs().sum()
 
@@ -448,7 +500,6 @@ def analyze_statement(file_bytes, file_name):
     # -----------------------------
     # 10. SAFE DAILY SPEND
     # -----------------------------
-    # safe spend = (this month savings) / 30 (if positive)
     safe_daily = max(0, this_month_savings) / 30
 
     # -----------------------------
@@ -492,7 +543,6 @@ def analyze_statement(file_bytes, file_name):
         "monthly_savings": monthly.to_dict(orient="records"),
         "category_summary": cat_summary.to_dict(orient="records"),
         "cleaned_csv": csv_output,
-        # ML-style predictions block
         "future_block": future_block,
     }
 
