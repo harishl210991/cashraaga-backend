@@ -2,7 +2,6 @@ import pandas as pd
 import numpy as np
 from io import BytesIO
 import calendar
-from datetime import datetime
 
 # Optional ML import – safe fallback if missing
 try:
@@ -76,8 +75,12 @@ def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
     # -----------------------------
     # 2. Project end-of-month savings (baseline)
     # -----------------------------
-    inflow_to_date = df_current[df_current["signed_amount"] > 0]["signed_amount"].sum()
-    outflow_to_date = -df_current[df_current["signed_amount"] < 0]["signed_amount"].sum()
+    inflow_to_date = df_current[df_current["signed_amount"] > 0][
+        "signed_amount"
+    ].sum()
+    outflow_to_date = -df_current[df_current["signed_amount"] < 0][
+        "signed_amount"
+    ].sum()
 
     avg_daily_inflow = inflow_to_date / max(days_elapsed, 1)
     avg_daily_outflow = outflow_to_date / max(days_elapsed, 1)
@@ -92,10 +95,11 @@ def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
     # 2b. ML refinement using past months (if sklearn is available)
     # -----------------------------
     if LinearRegression is not None:
-        # Build a simple monthly dataset: total inflow, total outflow, net
         monthly_ml = (
             df.assign(
-                inflow=lambda x: x["signed_amount"].where(x["signed_amount"] > 0, 0.0),
+                inflow=lambda x: x["signed_amount"].where(
+                    x["signed_amount"] > 0, 0.0
+                ),
                 outflow=lambda x: x["signed_amount"].where(
                     x["signed_amount"] < 0, 0.0
                 ),
@@ -110,7 +114,6 @@ def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
             .sort_values("month")
         )
 
-        # Only bother if we have enough history to learn from
         if len(monthly_ml) >= 3:
             X = monthly_ml[["total_inflow", "total_outflow"]].to_numpy()
             y = monthly_ml["net"].to_numpy()
@@ -119,13 +122,10 @@ def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
                 model = LinearRegression()
                 model.fit(X, y)
 
-                # For the current month, use projected inflow and outflow as features.
-                # projected_outflow is positive, but our training outflow is negative.
                 X_new = np.array([[projected_inflow, -projected_outflow]])
                 y_pred = model.predict(X_new)[0]
                 predicted_eom_savings = float(y_pred)
             except Exception:
-                # If anything weird happens, just keep the heuristic value.
                 pass
 
     # Simple confidence band: ±15%
@@ -142,7 +142,6 @@ def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
         .sort_values("month")
     )
 
-    # Overspend risk: either vs safe_daily_spend or vs typical net savings
     if safe_daily_spend and safe_daily_spend > 0:
         projected_budget_outflow = safe_daily_spend * days_in_month
         if projected_budget_outflow <= 0:
@@ -150,7 +149,6 @@ def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
         else:
             ratio = projected_outflow / projected_budget_outflow
     else:
-        # Compare predicted savings to average of previous 3 months
         prev_months = monthly_net[monthly_net["month"] < current_month]
         if not prev_months.empty:
             last3 = prev_months["signed_amount"].iloc[-3:]
@@ -185,11 +183,10 @@ def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
     if df_prev.empty:
         risky_categories = []
     else:
-        # Average monthly outflow per category from previous months
         prev_months_count = max(df_prev["month"].nunique(), 1)
 
         prev_cat = (
-            df_prev[df["signed_amount"] < 0]
+            df_prev[df_prev["signed_amount"] < 0]
             .assign(outflow=lambda x: -x["signed_amount"])
             .groupby("category")["outflow"]
             .sum()
@@ -200,7 +197,6 @@ def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
             prev_cat["total_outflow_prev"] / prev_months_count
         )
 
-        # Current month outflow to date per category
         curr_cat = (
             df_current[df_current["signed_amount"] < 0]
             .assign(outflow=lambda x: -x["signed_amount"])
@@ -247,6 +243,22 @@ def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
         "risky_categories": risky_categories,
     }
 
+
+def _looks_like_header(row: pd.Series) -> bool:
+    """Heuristic to detect the real header row in Excel exports."""
+    vals = [str(v).strip().lower() for v in row.tolist()]
+
+    has_date = any("date" in v for v in vals)
+
+    desc_keys = ["desc", "narrat", "narration", "particular", "details"]
+    has_desc = any(any(k in v for k in desc_keys) for v in vals)
+
+    amt_keys = ["amount", "amt", "withdrawal", "deposit", "debit", "credit"]
+    has_amt = any(any(k in v for k in amt_keys) for v in vals)
+
+    return has_date and has_desc and has_amt
+
+
 def analyze_statement(file_bytes, file_name):
     name = file_name.lower()
 
@@ -267,100 +279,90 @@ def analyze_statement(file_bytes, file_name):
             df = pd.DataFrame(data_rows, columns=[h.strip() for h in header])
 
     elif name.endswith(".xlsx"):
-        df = pd.read_excel(BytesIO(file_bytes))  # pandas will use openpyxl
+        # Always read header=None and detect header row – handles HDFC-style titles
+        df_raw = pd.read_excel(BytesIO(file_bytes), header=None)
+        header_row_idx = None
+        max_scan = min(60, len(df_raw))
+        for i in range(max_scan):
+            if _looks_like_header(df_raw.iloc[i]):
+                header_row_idx = i
+                break
+
+        if header_row_idx is None:
+            raise Exception(
+                "Could not locate header row in Excel. "
+                "Try exporting the statement again as CSV or simpler XLSX."
+            )
+
+        header = df_raw.iloc[header_row_idx].astype(str).tolist()
+        df = df_raw.iloc[header_row_idx + 1 :].copy()
+        df.columns = header
 
     elif name.endswith(".xls"):
-        # old Excel – needs xlrd installed
-        df = pd.read_excel(BytesIO(file_bytes), engine="xlrd")
+        # Old Excel – needs xlrd installed on the server
+        df_raw = pd.read_excel(BytesIO(file_bytes), header=None, engine="xlrd")
+        header_row_idx = None
+        max_scan = min(60, len(df_raw))
+        for i in range(max_scan):
+            if _looks_like_header(df_raw.iloc[i]):
+                header_row_idx = i
+                break
+
+        if header_row_idx is None:
+            raise Exception(
+                "Could not locate header row in .xls file. "
+                "Try exporting the statement again as CSV or XLSX."
+            )
+
+        header = df_raw.iloc[header_row_idx].astype(str).tolist()
+        df = df_raw.iloc[header_row_idx + 1 :].copy()
+        df.columns = header
 
     else:
         raise Exception("Unsupported file type. Please upload CSV or Excel.")
-
-    # -----------------------------
-    # 1b. EXCEL RESCUE – FIND REAL HEADER ROW
-    # -----------------------------
-    if name.endswith((".xls", ".xlsx")):
-        cols_lower = [str(c).lower() for c in df.columns]
-
-        has_core_cols = (
-            any("date" in c for c in cols_lower)
-            and (
-                any("desc" in c for c in cols_lower)
-                or any("narrat" in c for c in cols_lower)
-                or any("particular" in c for c in cols_lower)
-            )
-            and (
-                any("amount" in c for c in cols_lower)
-                or any("debit" in c for c in cols_lower)
-                or any("credit" in c for c in cols_lower)
-            )
-        )
-
-        # If the first row looks like a title (HDFC style), re-scan file
-        if not has_core_cols:
-            if name.endswith(".xlsx"):
-                df_raw = pd.read_excel(BytesIO(file_bytes), header=None)
-            else:
-                df_raw = pd.read_excel(
-                    BytesIO(file_bytes), header=None, engine="xlrd"
-                )
-
-            header_row_idx = None
-            max_scan = min(40, len(df_raw))  # scan top 40 rows
-
-            for i in range(max_scan):
-                row = df_raw.iloc[i].astype(str).str.lower()
-
-                if (
-                    any("date" in v for v in row)
-                    and (
-                        any("desc" in v for v in row)
-                        or any("narrat" in v for v in row)
-                        or any("particular" in v for v in row)
-                    )
-                    and (
-                        any("amount" in v for v in row)
-                        or any("debit" in v for v in row)
-                        or any("credit" in v for v in row)
-                    )
-                ):
-                    header_row_idx = i
-                    break
-
-            if header_row_idx is not None:
-                header = df_raw.iloc[header_row_idx].astype(str).tolist()
-                df = df_raw.iloc[header_row_idx + 1 :].copy()
-                df.columns = header
 
     # -----------------------------
     # 2. STANDARDIZE COLUMNS
     # -----------------------------
     df.columns = df.columns.str.strip().str.lower()
 
-    col_map = {}
+    col_map: dict[str, str] = {}
+
+    # Basic detection
     for c in df.columns:
         if "date" in c:
             col_map["date"] = c
-        if "desc" in c or "narrat" in c or "details" in c or "particular" in c:
+        if (
+            "desc" in c
+            or "narrat" in c
+            or "narration" in c
+            or "particular" in c
+            or "details" in c
+        ):
             col_map["description"] = c
         if "amount" in c:
             col_map["amount"] = c
-        if "debit" in c and "amount" not in col_map:
-            # we'll handle debit/credit pair below if needed
-            pass
         if "type" in c:
             col_map["type"] = c
 
-    # If no "amount" column, try to synthesize from debit/credit
+    # If we don't have a single amount column, synthesize from debit/credit/withdrawal/deposit
     if "amount" not in col_map:
-        debit_col = next((c for c in df.columns if "debit" in c), None)
-        credit_col = next((c for c in df.columns if "credit" in c), None)
+        debit_col = next(
+            (c for c in df.columns if "debit" in c or "withdrawal" in c), None
+        )
+        credit_col = next(
+            (c for c in df.columns if "credit" in c or "deposit" in c), None
+        )
         if debit_col or credit_col:
             df["amount"] = 0.0
             if debit_col:
-                df["amount"] -= pd.to_numeric(df[debit_col], errors="coerce").fillna(0)
+                df["amount"] -= (
+                    pd.to_numeric(df[debit_col], errors="coerce").fillna(0)
+                )
             if credit_col:
-                df["amount"] += pd.to_numeric(df[credit_col], errors="coerce").fillna(0)
+                df["amount"] += (
+                    pd.to_numeric(df[credit_col], errors="coerce").fillna(0)
+                )
             col_map["amount"] = "amount"
 
     df = df.rename(columns=col_map)
@@ -368,7 +370,8 @@ def analyze_statement(file_bytes, file_name):
     # Ensure existence
     if "date" not in df or "description" not in df or "amount" not in df:
         raise Exception(
-            f"Missing required columns (Date, Description, Amount). Found: {list(df.columns)}"
+            f"Missing required columns (Date, Description, Amount). "
+            f"Found: {list(df.columns)}"
         )
 
     # -----------------------------
@@ -392,7 +395,6 @@ def analyze_statement(file_bytes, file_name):
             axis=1,
         )
     else:
-        # If no type column exists, assume negative values are outflow
         df["signed_amount"] = df["amount"]
 
     # Remove invalid rows
