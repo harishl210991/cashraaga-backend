@@ -6,3 +6,4 @@ python-multipart
 numpy
 fastapi
 google-generativeai
+openpyxl
