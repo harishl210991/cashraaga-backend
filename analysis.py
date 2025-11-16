@@ -321,58 +321,65 @@ def analyze_statement(file_bytes, file_name):
     else:
         raise Exception("Unsupported file type. Please upload CSV or Excel.")
 
-    # -----------------------------
-    # 2. STANDARDIZE COLUMNS
-    # -----------------------------
-    df.columns = df.columns.str.strip().str.lower()
+# -----------------------------
+# 2. STANDARDIZE COLUMNS
+# -----------------------------
+df.columns = df.columns.str.strip().str.lower()
 
-    col_map: dict[str, str] = {}
+# Detect core columns
+date_col = next((c for c in df.columns if "date" in c), None)
 
-    # Basic detection
-    for c in df.columns:
-        if "date" in c:
-            col_map["date"] = c
-        if (
-            "desc" in c
-            or "narrat" in c
-            or "narration" in c
-            or "particular" in c
-            or "details" in c
-        ):
-            col_map["description"] = c
-        if "amount" in c:
-            col_map["amount"] = c
-        if "type" in c:
-            col_map["type"] = c
-
-    # If we don't have a single amount column, synthesize from debit/credit/withdrawal/deposit
-    if "amount" not in col_map:
-        debit_col = next(
-            (c for c in df.columns if "debit" in c or "withdrawal" in c), None
+desc_col = next(
+    (
+        c
+        for c in df.columns
+        if any(
+            k in c
+            for k in ["desc", "narrat", "narration", "particular", "details"]
         )
-        credit_col = next(
-            (c for c in df.columns if "credit" in c or "deposit" in c), None
-        )
-        if debit_col or credit_col:
-            df["amount"] = 0.0
-            if debit_col:
-                df["amount"] -= (
-                    pd.to_numeric(df[debit_col], errors="coerce").fillna(0)
-                )
-            if credit_col:
-                df["amount"] += (
-                    pd.to_numeric(df[credit_col], errors="coerce").fillna(0)
-                )
-            col_map["amount"] = "amount"
+    ),
+    None,
+)
 
-    df = df.rename(columns=col_map)
+amount_col = next((c for c in df.columns if "amount" in c), None)
 
-    # Ensure existence
-    if "date" not in df or "description" not in df or "amount" not in df:
-        raise Exception(
-            f"Missing required columns (Date, Description, Amount). "
-            f"Found: {list(df.columns)}"
-        )
+# Also look for withdrawal / deposit style columns for banks like HDFC
+debit_col = next(
+    (c for c in df.columns if "withdrawal" in c or "debit" in c), None
+)
+credit_col = next(
+    (c for c in df.columns if "deposit" in c or "credit" in c), None
+)
+
+# If we don't have a single amount column, synthesize from debit/credit/withdrawal/deposit
+if not amount_col and (debit_col or credit_col):
+    df["amount"] = 0.0
+    if debit_col:
+        df["amount"] -= pd.to_numeric(df[debit_col], errors="coerce").fillna(0)
+    if credit_col:
+        df["amount"] += pd.to_numeric(df[credit_col], errors="coerce").fillna(0)
+    amount_col = "amount"
+
+# Final validation
+if not date_col or not desc_col or not amount_col:
+    raise Exception(
+        "Missing required columns (Date, Description, Amount). "
+        f"Found: {list(df.columns)}"
+    )
+
+# Rename to the unified names used later
+rename_map = {
+    date_col: "date",
+    desc_col: "description",
+    amount_col: "amount",
+}
+
+# Keep 'type' if present
+type_col = next((c for c in df.columns if "type" in c), None)
+if type_col:
+    rename_map[type_col] = "type"
+
+df = df.rename(columns=rename_map)
 
     # -----------------------------
     # 3. CLEAN DATE + AMOUNT
