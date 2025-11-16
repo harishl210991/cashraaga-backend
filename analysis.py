@@ -1,6 +1,200 @@
 import pandas as pd
 import numpy as np
 from io import BytesIO
+import calendar
+from datetime import datetime
+
+
+def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
+    """
+    Light-weight prediction block based on current month progression
+    and historic behaviour. No heavy ML yet, but shaped like it.
+    """
+
+    if df.empty:
+        return {
+            "predicted_eom_savings": 0.0,
+            "predicted_eom_range": [0.0, 0.0],
+            "overspend_risk": {"level": "low", "probability": 0.0},
+            "risky_categories": [],
+        }
+
+    # Ensure we have required fields
+    if "date" not in df.columns or "signed_amount" not in df.columns:
+        return {
+            "predicted_eom_savings": 0.0,
+            "predicted_eom_range": [0.0, 0.0],
+            "overspend_risk": {"level": "low", "probability": 0.0},
+            "risky_categories": [],
+        }
+
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"])
+    df["month"] = df["date"].dt.to_period("M")
+
+    if "category" not in df.columns:
+        df["category"] = "Others"
+
+    # -----------------------------
+    # 1. Identify current & previous months
+    # -----------------------------
+    current_month = df["month"].max()
+    if pd.isna(current_month):
+        return {
+            "predicted_eom_savings": 0.0,
+            "predicted_eom_range": [0.0, 0.0],
+            "overspend_risk": {"level": "low", "probability": 0.0},
+            "risky_categories": [],
+        }
+
+    df_current = df[df["month"] == current_month]
+    df_prev = df[df["month"] != current_month]
+
+    if df_current.empty:
+        return {
+            "predicted_eom_savings": 0.0,
+            "predicted_eom_range": [0.0, 0.0],
+            "overspend_risk": {"level": "low", "probability": 0.0},
+            "risky_categories": [],
+        }
+
+    last_date = df_current["date"].max()
+    year = last_date.year
+    month = last_date.month
+    days_in_month = calendar.monthrange(year, month)[1]
+    days_elapsed = last_date.day
+
+    # -----------------------------
+    # 2. Project end-of-month savings
+    # -----------------------------
+    inflow_to_date = df_current[df_current["signed_amount"] > 0]["signed_amount"].sum()
+    outflow_to_date = -df_current[df_current["signed_amount"] < 0]["signed_amount"].sum()
+
+    avg_daily_inflow = inflow_to_date / max(days_elapsed, 1)
+    avg_daily_outflow = outflow_to_date / max(days_elapsed, 1)
+
+    projected_inflow = avg_daily_inflow * days_in_month
+    projected_outflow = avg_daily_outflow * days_in_month
+
+    predicted_eom_savings = float(projected_inflow - projected_outflow)
+
+    # Simple confidence band: ±15%
+    low_bound = float(predicted_eom_savings * 0.85)
+    high_bound = float(predicted_eom_savings * 1.15)
+
+    # -----------------------------
+    # 3. Overspend risk vs safe_daily_spend / history
+    # -----------------------------
+    # Monthly net savings history
+    monthly_net = (
+        df.groupby("month")["signed_amount"]
+        .sum()
+        .reset_index()
+        .sort_values("month")
+    )
+
+    # Overspend risk: either vs safe_daily_spend or vs typical net savings
+    if safe_daily_spend and safe_daily_spend > 0:
+        projected_budget_outflow = safe_daily_spend * days_in_month
+        if projected_budget_outflow <= 0:
+            ratio = 0.0
+        else:
+            ratio = projected_outflow / projected_budget_outflow
+    else:
+        # Compare predicted savings to average of previous 3 months
+        prev_months = monthly_net[monthly_net["month"] < current_month]
+        if not prev_months.empty:
+            last3 = prev_months["signed_amount"].iloc[-3:]
+            avg_net_last3 = last3.mean()
+        else:
+            avg_net_last3 = monthly_net["signed_amount"].iloc[-1]
+
+        if avg_net_last3 == 0:
+            ratio = 1.0
+        else:
+            ratio = max(0.0, (avg_net_last3 - predicted_eom_savings) / abs(avg_net_last3))
+
+    overspend_prob = float(max(0.0, min(1.0, ratio)))
+
+    if overspend_prob < 0.33:
+        level = "low"
+    elif overspend_prob < 0.66:
+        level = "medium"
+    else:
+        level = "high"
+
+    overspend_risk = {
+        "level": level,
+        "probability": overspend_prob,
+    }
+
+    # -----------------------------
+    # 4. Risky categories (where you may overspend)
+    # -----------------------------
+    if df_prev.empty:
+        risky_categories = []
+    else:
+        # Average monthly outflow per category from previous months
+        prev_months_count = max(df_prev["month"].nunique(), 1)
+
+        prev_cat = (
+            df_prev[df_prev["signed_amount"] < 0]
+            .assign(outflow=lambda x: -x["signed_amount"])
+            .groupby("category")["outflow"]
+            .sum()
+            .rename("total_outflow_prev")
+            .reset_index()
+        )
+        prev_cat["baseline_outflow"] = prev_cat["total_outflow_prev"] / prev_months_count
+
+        # Current month outflow to date per category
+        curr_cat = (
+            df_current[df_current["signed_amount"] < 0]
+            .assign(outflow=lambda x: -x["signed_amount"])
+            .groupby("category")["outflow"]
+            .sum()
+            .rename("current_outflow_to_date")
+            .reset_index()
+        )
+
+        cat_df = prev_cat.merge(curr_cat, on="category", how="outer").fillna(0.0)
+
+        if days_elapsed > 0:
+            cat_df["projected_outflow"] = (
+                cat_df["current_outflow_to_date"] * days_in_month / days_elapsed
+            )
+        else:
+            cat_df["projected_outflow"] = cat_df["current_outflow_to_date"]
+
+        cat_df["overrun_ratio"] = np.where(
+            cat_df["baseline_outflow"] > 0,
+            cat_df["projected_outflow"] / cat_df["baseline_outflow"],
+            np.inf,
+        )
+
+        risky_df = (
+            cat_df[cat_df["overrun_ratio"] >= 1.2]
+            .sort_values("overrun_ratio", ascending=False)
+            .head(3)
+        )
+
+        risky_categories = [
+            {
+                "name": row["category"],
+                "projected_amount": float(row["projected_outflow"]),
+                "baseline_amount": float(row["baseline_outflow"]),
+            }
+            for _, row in risky_df.iterrows()
+        ]
+
+    return {
+        "predicted_eom_savings": predicted_eom_savings,
+        "predicted_eom_range": [low_bound, high_bound],
+        "overspend_risk": overspend_risk,
+        "risky_categories": risky_categories,
+    }
+
 
 def analyze_statement(file_bytes, file_name):
     # -----------------------------
@@ -70,7 +264,7 @@ def analyze_statement(file_bytes, file_name):
     # 4. CATEGORY MAPPING
     # -----------------------------
     def detect_category(desc):
-        d = desc.lower()
+        d = str(desc).lower()
 
         mapping = {
             "salary": ["salary"],
@@ -129,7 +323,7 @@ def analyze_statement(file_bytes, file_name):
     # -----------------------------
     # 7. UPI OUTFLOW
     # -----------------------------
-    upi_mask = df["description"].str.lower().str.contains("upi")
+    upi_mask = df["description"].astype(str).str.lower().str.contains("upi")
     upi_df = df[(upi_mask) & (df["signed_amount"] < 0)]
     upi_total = upi_df["signed_amount"].abs().sum()
 
@@ -175,7 +369,12 @@ def analyze_statement(file_bytes, file_name):
     safe_daily = max(0, this_month_savings) / 30
 
     # -----------------------------
-    # 11. CLEANED CSV EXPORT
+    # 11. FUTURE / PREDICTION BLOCK
+    # -----------------------------
+    future_block = build_future_block(df, safe_daily)
+
+    # -----------------------------
+    # 12. CLEANED CSV EXPORT
     # -----------------------------
     cleaned_export = df[["date", "description", "signed_amount", "category"]].copy()
     cleaned_export["date"] = cleaned_export["date"].astype(str)
@@ -183,7 +382,7 @@ def analyze_statement(file_bytes, file_name):
     csv_output = cleaned_export.to_csv(index=False)
 
     # -----------------------------
-    # 12. BUILD RESULT JSON
+    # 13. BUILD RESULT JSON
     # -----------------------------
     result = {
         "summary": {
@@ -214,7 +413,10 @@ def analyze_statement(file_bytes, file_name):
 
         "category_summary": cat_summary.to_dict(orient="records"),
 
-        "cleaned_csv": csv_output
+        "cleaned_csv": csv_output,
+
+        # NEW: ML-style predictions block
+        "future_block": future_block
     }
 
     return result
