@@ -252,7 +252,9 @@ def analyze_statement(file_bytes, file_name):
     # -----------------------------
     # 1. LOAD FILE
     # -----------------------------
-    if file_name.lower().endswith(".csv"):
+    name = file_name.lower()
+
+    if name.endswith(".csv"):
         df = pd.read_csv(BytesIO(file_bytes))
 
         # Handle case like your dummy CSV where everything is quoted
@@ -265,9 +267,27 @@ def analyze_statement(file_bytes, file_name):
 
             header, data_rows = split_rows[0], split_rows[1:]
             df = pd.DataFrame(data_rows, columns=[h.strip() for h in header])
-    else:
-        df = pd.read_excel(BytesIO(file_bytes))
 
+    elif name.endswith(".xlsx"):
+        # Newer Excel files
+        df = pd.read_excel(BytesIO(file_bytes), engine="openpyxl")
+
+    elif name.endswith(".xls"):
+        # Old Excel files – need xlrd
+        try:
+            import xlrd  # noqa: F401
+        except ImportError:
+            raise Exception(
+                "Old .xls Excel files need extra support on the server. "
+                "Install xlrd>=2.0.1 (or export your statement as .csv/.xlsx and upload that)."
+            )
+
+        df = pd.read_excel(BytesIO(file_bytes), engine="xlrd")
+
+    else:
+        raise Exception(
+            "Unsupported file type. Please upload a .csv or .xlsx/.xls bank statement."
+        )
     # -----------------------------
     # 2. STANDARDIZE COLUMNS
     # -----------------------------
