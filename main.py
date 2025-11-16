@@ -1,6 +1,7 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.encoders import jsonable_encoder  # 👈 important
 
 from analysis import analyze_statement
 
@@ -36,7 +37,11 @@ async def analyze_file(file: UploadFile = File(...)):
         else:
             result["cleaned_csv"] = ""
 
-        return JSONResponse(content=result)
+        # 🔧 make everything JSON-safe (np.int64 -> int, etc.)
+        safe_result = jsonable_encoder(result)
+
+        return JSONResponse(content=safe_result)
+
     except Exception as e:
         return JSONResponse(
             status_code=400,
