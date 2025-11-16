@@ -1,422 +1,527 @@
-import pandas as pd
-import numpy as np
-from io import BytesIO
-import calendar
+import io
 from datetime import datetime
+from calendar import monthrange
+from typing import List, Dict, Any
+
+import pandas as pd
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI()
+
+# CORS – allow your frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # tighten later if you want
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
-def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
-    """
-    Light-weight prediction block based on current month progression
-    and historic behaviour. No heavy ML yet, but shaped like it.
-    """
+# -----------------------------
+# Helpers
+# -----------------------------
 
-    if df.empty:
-        return {
-            "predicted_eom_savings": 0.0,
-            "predicted_eom_range": [0.0, 0.0],
-            "overspend_risk": {"level": "low", "probability": 0.0},
-            "risky_categories": [],
-        }
 
-    # Ensure we have required fields
-    if "date" not in df.columns or "signed_amount" not in df.columns:
-        return {
-            "predicted_eom_savings": 0.0,
-            "predicted_eom_range": [0.0, 0.0],
-            "overspend_risk": {"level": "low", "probability": 0.0},
-            "risky_categories": [],
-        }
-
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df = df.dropna(subset=["date"])
-    df["month"] = df["date"].dt.to_period("M")
-
-    if "category" not in df.columns:
-        df["category"] = "Others"
-
-    # -----------------------------
-    # 1. Identify current & previous months
-    # -----------------------------
-    current_month = df["month"].max()
-    if pd.isna(current_month):
-        return {
-            "predicted_eom_savings": 0.0,
-            "predicted_eom_range": [0.0, 0.0],
-            "overspend_risk": {"level": "low", "probability": 0.0},
-            "risky_categories": [],
-        }
-
-    df_current = df[df["month"] == current_month]
-    df_prev = df[df["month"] != current_month]
-
-    if df_current.empty:
-        return {
-            "predicted_eom_savings": 0.0,
-            "predicted_eom_range": [0.0, 0.0],
-            "overspend_risk": {"level": "low", "probability": 0.0},
-            "risky_categories": [],
-        }
-
-    last_date = df_current["date"].max()
-    year = last_date.year
-    month = last_date.month
-    days_in_month = calendar.monthrange(year, month)[1]
-    days_elapsed = last_date.day
-
-    # -----------------------------
-    # 2. Project end-of-month savings
-    # -----------------------------
-    inflow_to_date = df_current[df_current["signed_amount"] > 0]["signed_amount"].sum()
-    outflow_to_date = -df_current[df_current["signed_amount"] < 0]["signed_amount"].sum()
-
-    avg_daily_inflow = inflow_to_date / max(days_elapsed, 1)
-    avg_daily_outflow = outflow_to_date / max(days_elapsed, 1)
-
-    projected_inflow = avg_daily_inflow * days_in_month
-    projected_outflow = avg_daily_outflow * days_in_month
-
-    predicted_eom_savings = float(projected_inflow - projected_outflow)
-
-    # Simple confidence band: ±15%
-    low_bound = float(predicted_eom_savings * 0.85)
-    high_bound = float(predicted_eom_savings * 1.15)
-
-    # -----------------------------
-    # 3. Overspend risk vs safe_daily_spend / history
-    # -----------------------------
-    # Monthly net savings history
-    monthly_net = (
-        df.groupby("month")["signed_amount"]
-        .sum()
-        .reset_index()
-        .sort_values("month")
-    )
-
-    # Overspend risk: either vs safe_daily_spend or vs typical net savings
-    if safe_daily_spend and safe_daily_spend > 0:
-        projected_budget_outflow = safe_daily_spend * days_in_month
-        if projected_budget_outflow <= 0:
-            ratio = 0.0
-        else:
-            ratio = projected_outflow / projected_budget_outflow
-    else:
-        # Compare predicted savings to average of previous 3 months
-        prev_months = monthly_net[monthly_net["month"] < current_month]
-        if not prev_months.empty:
-            last3 = prev_months["signed_amount"].iloc[-3:]
-            avg_net_last3 = last3.mean()
-        else:
-            avg_net_last3 = monthly_net["signed_amount"].iloc[-1]
-
-        if avg_net_last3 == 0:
-            ratio = 1.0
-        else:
-            ratio = max(0.0, (avg_net_last3 - predicted_eom_savings) / abs(avg_net_last3))
-
-    overspend_prob = float(max(0.0, min(1.0, ratio)))
-
-    if overspend_prob < 0.33:
-        level = "low"
-    elif overspend_prob < 0.66:
-        level = "medium"
-    else:
-        level = "high"
-
-    overspend_risk = {
-        "level": level,
-        "probability": overspend_prob,
-    }
-
-    # -----------------------------
-    # 4. Risky categories (where you may overspend)
-    # -----------------------------
-    if df_prev.empty:
-        risky_categories = []
-    else:
-        # Average monthly outflow per category from previous months
-        prev_months_count = max(df_prev["month"].nunique(), 1)
-
-        prev_cat = (
-            df_prev[df_prev["signed_amount"] < 0]
-            .assign(outflow=lambda x: -x["signed_amount"])
-            .groupby("category")["outflow"]
-            .sum()
-            .rename("total_outflow_prev")
-            .reset_index()
-        )
-        prev_cat["baseline_outflow"] = prev_cat["total_outflow_prev"] / prev_months_count
-
-        # Current month outflow to date per category
-        curr_cat = (
-            df_current[df_current["signed_amount"] < 0]
-            .assign(outflow=lambda x: -x["signed_amount"])
-            .groupby("category")["outflow"]
-            .sum()
-            .rename("current_outflow_to_date")
-            .reset_index()
-        )
-
-        cat_df = prev_cat.merge(curr_cat, on="category", how="outer").fillna(0.0)
-
-        if days_elapsed > 0:
-            cat_df["projected_outflow"] = (
-                cat_df["current_outflow_to_date"] * days_in_month / days_elapsed
-            )
-        else:
-            cat_df["projected_outflow"] = cat_df["current_outflow_to_date"]
-
-        cat_df["overrun_ratio"] = np.where(
-            cat_df["baseline_outflow"] > 0,
-            cat_df["projected_outflow"] / cat_df["baseline_outflow"],
-            np.inf,
-        )
-
-        risky_df = (
-            cat_df[cat_df["overrun_ratio"] >= 1.2]
-            .sort_values("overrun_ratio", ascending=False)
-            .head(3)
-        )
-
-        risky_categories = [
-            {
-                "name": row["category"],
-                "projected_amount": float(row["projected_outflow"]),
-                "baseline_amount": float(row["baseline_outflow"]),
-            }
-            for _, row in risky_df.iterrows()
-        ]
-
-    return {
-        "predicted_eom_savings": predicted_eom_savings,
-        "predicted_eom_range": [low_bound, high_bound],
-        "overspend_risk": overspend_risk,
-        "risky_categories": risky_categories,
-    }
-
-
-def analyze_statement(file_bytes, file_name):
-    # -----------------------------
-    # 1. LOAD FILE
-    # -----------------------------
-    if file_name.lower().endswith(".csv"):
-        df = pd.read_csv(BytesIO(file_bytes))
-    else:
-        df = pd.read_excel(BytesIO(file_bytes))
-
-    # -----------------------------
-    # 2. STANDARDIZE COLUMNS
-    # -----------------------------
     df.columns = df.columns.str.strip().str.lower()
 
-    # Required minimal mapping
     col_map = {}
+
     for c in df.columns:
-        if "date" in c:
+        if "date" in c and "value" not in c and "statement" not in c:
             col_map["date"] = c
-        if "desc" in c:
+        if "desc" in c or "narration" in c or "details" in c:
             col_map["description"] = c
-        if "amount" in c:
+        if "amount" in c and "balance" not in c:
             col_map["amount"] = c
-        if "type" in c:
+        if "type" in c or "dr/cr" in c or "debit/credit" in c:
             col_map["type"] = c
+        if "category" in c:
+            col_map["category"] = c
 
     df = df.rename(columns=col_map)
 
-    # Ensure existence
     if "date" not in df or "description" not in df or "amount" not in df:
-        raise Exception("Missing required columns (Date, Description, Amount).")
+        raise HTTPException(
+            status_code=400,
+            detail="Missing required columns. Need something like Date, Description, Amount.",
+        )
 
-    # -----------------------------
-    # 3. CLEAN DATE + AMOUNT
-    # -----------------------------
-    df["date"] = pd.to_datetime(df["date"], dayfirst=True, errors="coerce")
+    # parse dates
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"])
 
-    # if CSV has commas or ₹ symbol
+    # clean description
+    df["description"] = df["description"].astype(str)
+
+    # clean amount
     df["amount"] = (
         df["amount"]
         .astype(str)
         .str.replace(",", "", regex=False)
-        .str.replace("₹", "", regex=False)
+        .str.strip()
+        .replace("", "0")
+        .astype(float)
     )
 
-    df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
-
-    # Apply CR/DR correction if provided
+    # handle type if present (CR/DR convention)
     if "type" in df.columns:
-        df["type"] = df["type"].astype(str).str.upper()
-        df["signed_amount"] = df.apply(
-            lambda row: row["amount"] if row["type"] == "CR" else -abs(row["amount"]),
-            axis=1
-        )
-    else:
-        # If no type column exists, assume negative values are outflow
-        df["signed_amount"] = df["amount"]
+        t = df["type"].astype(str).str.lower()
+        # if looks like CR/DR type, adjust sign
+        mask_dr = t.str.contains("dr")
+        mask_cr = t.str.contains("cr")
+        # for DR, make amount negative; for CR, positive
+        df.loc[mask_dr, "amount"] = -df.loc[mask_dr, "amount"].abs()
+        df.loc[mask_cr, "amount"] = df.loc[mask_cr, "amount"].abs()
 
-    # Remove invalid rows
-    df = df.dropna(subset=["date", "signed_amount"])
+    return df
 
-    # Sort properly
-    df = df.sort_values("date")
 
-    # -----------------------------
-    # 4. CATEGORY MAPPING
-    # -----------------------------
-    def detect_category(desc):
-        d = str(desc).lower()
+def extract_month_info(df: pd.DataFrame):
+    df = df.copy()
+    df["month_period"] = df["date"].dt.to_period("M")
+    df["month_str"] = df["month_period"].astype(str)
 
-        mapping = {
-            "salary": ["salary"],
-            "rent": ["rent"],
-            "shopping": ["amazon", "flipkart", "myntra", "purchase"],
-            "food & dining": ["swiggy", "zomato", "breakfast", "lunch", "dinner"],
-            "fuel & transport": ["petrol", "hpcl", "bpcl", "fuel", "uber", "ola"],
-            "mobile & internet": ["airtel", "postpaid", "internet", "recharge"],
-            "subscriptions": ["netflix", "hotstar", "prime video"],
-            "emi": ["emi", "loan"],
-            "medical": ["medical", "pharmacy", "hospital"],
-        }
+    last_date = df["date"].max()
+    current_period = last_date.to_period("M")
+    current_month_str = str(current_period)
 
-        for cat, keys in mapping.items():
-            if any(k in d for k in keys):
-                return cat.capitalize()
+    # previous month
+    prev_period = current_period - 1
+    prev_month_str = str(prev_period)
 
-        return "Others"
+    return df, current_period, current_month_str, prev_month_str, last_date
 
-    df["category"] = df["description"].astype(str).apply(detect_category)
 
-    # -----------------------------
-    # 5. AGGREGATES
-    # -----------------------------
-    df["month"] = df["date"].dt.to_period("M")
+def compute_summary(df: pd.DataFrame) -> Dict[str, Any]:
+    df, current_period, current_month_str, prev_month_str, last_date = extract_month_info(
+        df
+    )
 
-    # TOTAL INFLOW / OUTFLOW
-    inflow = df[df["signed_amount"] > 0]["signed_amount"].sum()
-    outflow = df[df["signed_amount"] < 0]["signed_amount"].abs().sum()
+    # inflow/outflow overall
+    inflow = df.loc[df["amount"] > 0, "amount"].sum()
+    outflow = -df.loc[df["amount"] < 0, "amount"].sum()  # make positive
     net_savings = inflow - outflow
 
-    # -----------------------------
-    # 6. MONTHLY SAVINGS
-    # -----------------------------
-    monthly = (
-        df.groupby("month")["signed_amount"].sum().reset_index()
-    )
-    monthly["month"] = monthly["month"].astype(str)
+    # monthly savings = inflow - outflow per month (using signed amount)
+    monthly_group = df.groupby("month_str")["amount"].sum().reset_index()
+    monthly_group = monthly_group.sort_values("month_str")
 
-    # Latest month
-    latest_month = df["month"].max()
-    latest_month_str = str(latest_month)
+    # this month + prev
+    this_row = monthly_group[monthly_group["month_str"] == current_month_str]
+    prev_row = monthly_group[monthly_group["month_str"] == prev_month_str]
 
-    this_month_df = df[df["month"] == latest_month]
-    this_month_savings = this_month_df["signed_amount"].sum()
+    this_savings = float(this_row["amount"].iloc[0]) if not this_row.empty else 0.0
+    prev_savings = float(prev_row["amount"].iloc[0]) if not prev_row.empty else 0.0
 
-    # Compare to previous month
-    prev_month = (latest_month - 1)
-    if prev_month in df["month"].unique():
-        prev_savings = df[df["month"] == prev_month]["signed_amount"].sum()
-        mom_change = this_month_savings - prev_savings
+    if prev_savings == 0:
+        mom_change = 0.0
     else:
-        prev_savings = 0
-        mom_change = 0
+        mom_change = (this_savings - prev_savings) / abs(prev_savings) * 100
 
-    # -----------------------------
-    # 7. UPI OUTFLOW
-    # -----------------------------
-    upi_mask = df["description"].astype(str).str.lower().str.contains("upi")
-    upi_df = df[(upi_mask) & (df["signed_amount"] < 0)]
-    upi_total = upi_df["signed_amount"].abs().sum()
+    # safe daily spend: assume you can safely spend income - 20% savings target
+    current_month_df = df[df["month_str"] == current_month_str]
+    month_income = current_month_df.loc[current_month_df["amount"] > 0, "amount"].sum()
 
-    # Latest month UPI
-    upi_month_df = upi_df[upi_df["month"] == latest_month]
-    upi_month_total = upi_month_df["signed_amount"].abs().sum()
+    year = last_date.year
+    month = last_date.month
+    days_in_month = monthrange(year, month)[1]
 
-    if not upi_month_df.empty:
-        top_upi_handle = (
-            upi_month_df.groupby("description")["signed_amount"]
-            .sum()
-            .abs()
-            .sort_values(ascending=False)
-            .index[0]
-        )
-    else:
-        top_upi_handle = None
+    target_savings = 0.2 * month_income
+    safe_spend_budget = max(month_income - target_savings, 0.0)
+    safe_daily_spend = safe_spend_budget / days_in_month if days_in_month > 0 else 0.0
 
-    # -----------------------------
-    # 8. EMI LOAD
-    # -----------------------------
-    emi_df = df[df["category"] == "Emi"]
-    emi_month_df = emi_df[emi_df["month"] == latest_month]
-
-    emi_load = emi_month_df["signed_amount"].abs().sum()
-    emi_months = emi_df["month"].nunique()
-
-    # -----------------------------
-    # 9. CATEGORY SUMMARY (DONUT)
-    # -----------------------------
-    cat_summary = (
-        df[df["signed_amount"] < 0]
-        .groupby("category")["signed_amount"]
-        .sum()
-        .abs()
-        .reset_index()
-    ).sort_values("signed_amount", ascending=False)
-
-    # -----------------------------
-    # 10. SAFE DAILY SPEND
-    # -----------------------------
-    # safe spend = (this month savings) / 30 (if positive)
-    safe_daily = max(0, this_month_savings) / 30
-
-    # -----------------------------
-    # 11. FUTURE / PREDICTION BLOCK
-    # -----------------------------
-    future_block = build_future_block(df, safe_daily)
-
-    # -----------------------------
-    # 12. CLEANED CSV EXPORT
-    # -----------------------------
-    cleaned_export = df[["date", "description", "signed_amount", "category"]].copy()
-    cleaned_export["date"] = cleaned_export["date"].astype(str)
-
-    csv_output = cleaned_export.to_csv(index=False)
-
-    # -----------------------------
-    # 13. BUILD RESULT JSON
-    # -----------------------------
-    result = {
+    return {
         "summary": {
-            "inflow": inflow,
-            "outflow": outflow,
-            "net_savings": net_savings,
+            "inflow": float(round(inflow)),
+            "outflow": float(round(outflow)),
+            "net_savings": float(round(net_savings)),
             "this_month": {
-                "month": latest_month_str,
-                "savings": this_month_savings,
-                "prev_savings": prev_savings,
-                "mom_change": mom_change
+                "month": last_date.strftime("%b %Y"),
+                "savings": float(round(this_savings)),
+                "prev_savings": float(round(prev_savings)),
+                "mom_change": float(round(mom_change)),
             },
-            "safe_daily_spend": safe_daily
+            "safe_daily_spend": float(round(safe_daily_spend)),
         },
+        "monthly_group": monthly_group,
+        "current_month_str": current_month_str,
+        "prev_month_str": prev_month_str,
+        "last_date": last_date,
+        "days_in_month": days_in_month,
+    }
 
-        "upi": {
-            "this_month": upi_month_total,
-            "top_handle": top_upi_handle,
-            "total_upi": upi_total
+
+def compute_upi_info(df: pd.DataFrame, current_month_str: str) -> Dict[str, Any]:
+    df = df.copy()
+    df["month_str"] = df["date"].dt.to_period("M").astype(str)
+
+    # identify UPI-like transactions
+    upi_mask = df["description"].str.contains("upi|vpa|@paytm|@oksbi|@okicici|@okaxis", case=False, na=False)
+    upi_df = df[upi_mask]
+
+    this_month = upi_df[upi_df["month_str"] == current_month_str]
+
+    # outflow via UPI = negative amounts
+    total_upi = -upi_df.loc[upi_df["amount"] < 0, "amount"].sum()
+    this_month_upi = -this_month.loc[this_month["amount"] < 0, "amount"].sum()
+
+    # extract handles
+    def extract_handle(desc: str) -> str:
+        import re
+
+        m = re.findall(r"([\w\.\-]+@\w+)", desc)
+        return m[0].lower() if m else ""
+
+    if not upi_df.empty:
+        upi_df["handle"] = upi_df["description"].apply(extract_handle)
+        handles = upi_df["handle"]
+        handles = handles[handles != ""]
+        if not handles.empty:
+            top_handle = handles.value_counts().idxmax()
+        else:
+            top_handle = None
+    else:
+        top_handle = None
+
+    return {
+        "this_month": float(round(this_month_upi)),
+        "top_handle": top_handle,
+        "total_upi": float(round(total_upi)),
+    }
+
+
+def compute_emi_info(df: pd.DataFrame) -> Dict[str, Any]:
+    df = df.copy()
+    df["month_str"] = df["date"].dt.to_period("M").astype(str)
+
+    # crude EMI detection
+    emi_mask = df["description"].str.contains(
+        "emi|loan|instalment|installment", case=False, na=False
+    )
+    emi_df = df[emi_mask & (df["amount"] < 0)]
+
+    if emi_df.empty:
+        return {"this_month": 0.0, "months_tracked": 0}
+
+    last_month_str = str(df["date"].max().to_period("M"))
+    this_month_emi = -emi_df.loc[emi_df["month_str"] == last_month_str, "amount"].sum()
+
+    months_tracked = emi_df["month_str"].nunique()
+
+    return {
+        "this_month": float(round(this_month_emi)),
+        "months_tracked": int(months_tracked),
+    }
+
+
+def compute_monthly_savings_series(monthly_group: pd.DataFrame) -> List[Dict[str, Any]]:
+    out = []
+    for _, row in monthly_group.iterrows():
+        out.append(
+            {
+                "month": row["month_str"],
+                "signed_amount": float(round(row["amount"])),
+            }
+        )
+    return out
+
+
+def compute_category_summary(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    df = df.copy()
+
+    # if we already have category, use it; else one bucket
+    if "category" in df.columns:
+        cat_group = (
+            df.groupby("category")["amount"].sum().reset_index().sort_values(
+                "amount"
+            )
+        )
+        cat_group["signed_amount"] = -cat_group["amount"]  # positive spend
+        cat_group = cat_group[cat_group["signed_amount"] > 0]
+        rows = []
+        for _, row in cat_group.iterrows():
+            rows.append(
+                {
+                    "category": str(row["category"]),
+                    "signed_amount": float(round(row["signed_amount"])),
+                }
+            )
+        return rows
+
+    # fallback: single "Spend" category = all negative amounts
+    total_spend = -df.loc[df["amount"] < 0, "amount"].sum()
+    if total_spend <= 0:
+        return []
+    return [
+        {
+            "category": "Spends",
+            "signed_amount": float(round(total_spend)),
+        }
+    ]
+
+
+# -----------------------------
+# Future / risk logic
+# -----------------------------
+
+
+def compute_overspend_risk(
+    safe_monthly_limit: float, projected_month_spend: float
+) -> Dict[str, Any]:
+    """
+    Turn safe vs projected spend into:
+    - risk level
+    - probability 0–1
+    """
+    if safe_monthly_limit <= 0:
+        return {"level": "medium", "probability": 0.5}
+
+    ratio = projected_month_spend / safe_monthly_limit  # >1 means overshoot
+
+    # discrete bucket
+    if ratio <= 0.9:
+        level = "low"
+    elif ratio <= 1.1:
+        level = "medium"
+    else:
+        level = "high"
+
+    # smooth probability: 0.7x safe -> 0, 1.4x safe -> 1
+    prob = (ratio - 0.7) / (1.4 - 0.7)
+    prob = max(0.0, min(1.0, prob))
+
+    return {"level": level, "probability": prob}
+
+
+def compute_risky_categories(
+    df: pd.DataFrame,
+    current_month_str: str,
+    days_in_month: int,
+) -> List[Dict[str, Any]]:
+    """
+    Compare current month's pace vs baseline average across past months per category.
+    Requires a 'category' column; if not present, returns [].
+    """
+    if "category" not in df.columns:
+        return []
+
+    df = df.copy()
+    df["month_str"] = df["date"].dt.to_period("M").astype(str)
+
+    current_df = df[df["month_str"] == current_month_str]
+    past_df = df[df["month_str"] != current_month_str]
+
+    if current_df.empty or past_df.empty:
+        return []
+
+    last_date = current_df["date"].max()
+    days_elapsed = last_date.day
+    if days_elapsed <= 0:
+        return []
+
+    # only consider spend (negative amounts)
+    current_spends = (
+        current_df[current_df["amount"] < 0]
+        .groupby("category")["amount"]
+        .sum()
+        .reset_index()
+    )
+    current_spends["current_spend"] = -current_spends["amount"]  # positive
+
+    past_spends = (
+        past_df[past_df["amount"] < 0]
+        .groupby(["month_str", "category"])["amount"]
+        .sum()
+        .reset_index()
+    )
+    if past_spends.empty:
+        return []
+
+    past_spends["spend_abs"] = -past_spends["amount"]
+    baseline = (
+        past_spends.groupby("category")["spend_abs"].mean().reset_index()
+    )  # avg per month
+
+    merged = current_spends.merge(baseline, on="category", how="left")
+    merged = merged.rename(columns={"spend_abs": "baseline_monthly"})
+
+    rows = []
+    for _, row in merged.iterrows():
+        cat = str(row["category"])
+        current_spend = float(row["current_spend"])
+        baseline_monthly = float(row.get("baseline_monthly", 0.0))
+
+        # project for full month
+        projected_monthly = current_spend * days_in_month / days_elapsed
+
+        if baseline_monthly <= 0:
+            continue
+
+        # mark risky if projected > 120% of baseline
+        if projected_monthly > 1.2 * baseline_monthly:
+            rows.append(
+                {
+                    "name": cat,
+                    "projected_amount": float(round(projected_monthly)),
+                    "baseline_amount": float(round(baseline_monthly)),
+                }
+            )
+
+    # sort by how bad it is
+    rows = sorted(
+        rows,
+        key=lambda r: r["projected_amount"] - r["baseline_amount"],
+        reverse=True,
+    )
+
+    return rows[:5]
+
+
+def build_future_block(
+    df: pd.DataFrame,
+    summary: Dict[str, Any],
+    current_month_str: str,
+    days_in_month: int,
+) -> Dict[str, Any]:
+    df = df.copy()
+    df["month_str"] = df["date"].dt.to_period("M").astype(str)
+
+    current_df = df[df["month_str"] == current_month_str]
+    if current_df.empty:
+        # nothing to predict
+        return {
+            "predicted_eom_savings": 0.0,
+            "predicted_eom_range": [0.0, 0.0],
+            "overspend_risk": {"level": "medium", "probability": 0.5},
+            "risky_categories": [],
+            "diagnostics": {
+                "safe_monthly_limit": 0.0,
+                "projected_month_spend": 0.0,
+                "current_month_spend": 0.0,
+            },
+        }
+
+    last_date = current_df["date"].max()
+    days_elapsed = last_date.day
+    if days_elapsed <= 0:
+        days_elapsed = 1
+
+    # current spend (outflow) this month
+    current_month_spend = -current_df.loc[current_df["amount"] < 0, "amount"].sum()
+    # current income this month
+    current_month_income = current_df.loc[current_df["amount"] > 0, "amount"].sum()
+
+    # project spend for entire month from pace
+    projected_month_spend = current_month_spend * days_in_month / days_elapsed
+
+    # safe monthly limit from summary.safe_daily_spend
+    safe_daily = summary.get("safe_daily_spend", 0.0) or 0.0
+    safe_monthly_limit = safe_daily * days_in_month
+
+    # predicted month-end savings = income - projected spend (simplified)
+    predicted_eom_savings = current_month_income - projected_month_spend
+
+    # create a fuzzy ±20% range around prediction
+    low = predicted_eom_savings * 0.8
+    high = predicted_eom_savings * 1.2
+
+    overspend_risk = compute_overspend_risk(
+        safe_monthly_limit=safe_monthly_limit,
+        projected_month_spend=projected_month_spend,
+    )
+
+    risky_categories = compute_risky_categories(
+        df=df,
+        current_month_str=current_month_str,
+        days_in_month=days_in_month,
+    )
+
+    future_block = {
+        "predicted_eom_savings": float(round(predicted_eom_savings)),
+        "predicted_eom_range": [
+            float(round(low)),
+            float(round(high)),
+        ],
+        "overspend_risk": overspend_risk,
+        "risky_categories": risky_categories,
+        "diagnostics": {
+            "safe_monthly_limit": float(round(safe_monthly_limit)),
+            "projected_month_spend": float(round(projected_month_spend)),
+            "current_month_spend": float(round(current_month_spend)),
         },
+    }
 
-        "emi": {
-            "this_month": emi_load,
-            "months_tracked": emi_months
-        },
+    return future_block
 
-        "monthly_savings": monthly.to_dict(orient="records"),
 
-        "category_summary": cat_summary.to_dict(orient="records"),
+# -----------------------------
+# Main analysis
+# -----------------------------
 
-        "cleaned_csv": csv_output,
 
-        # NEW: ML-style predictions block
-        "future_block": future_block
+def analyze_statement(file_bytes: bytes, file_name: str) -> Dict[str, Any]:
+    # 1. Load
+    if file_name.lower().endswith(".csv"):
+        df = pd.read_csv(io.BytesIO(file_bytes))
+    else:
+        df = pd.read_excel(io.BytesIO(file_bytes))
+
+    # 2. Normalize columns
+    df = normalize_columns(df)
+
+    # 3. Summary
+    summary_info = compute_summary(df)
+    summary = summary_info["summary"]
+    monthly_group = summary_info["monthly_group"]
+    current_month_str = summary_info["current_month_str"]
+    days_in_month = summary_info["days_in_month"]
+
+    # 4. UPI / EMI / monthly savings / categories
+    upi_info = compute_upi_info(df, current_month_str=current_month_str)
+    emi_info = compute_emi_info(df)
+    monthly_savings = compute_monthly_savings_series(monthly_group)
+    category_summary = compute_category_summary(df)
+
+    # 5. Future / risk block
+    future_block = build_future_block(
+        df=df,
+        summary=summary,
+        current_month_str=current_month_str,
+        days_in_month=days_in_month,
+    )
+
+    # 6. Cleaned CSV output
+    cleaned_csv = df.to_csv(index=False)
+
+    result = {
+        "summary": summary,
+        "upi": upi_info,
+        "emi": emi_info,
+        "monthly_savings": monthly_savings,
+        "category_summary": category_summary,
+        "cleaned_csv": cleaned_csv,
+        "future_block": future_block,
     }
 
     return result
+
+
+# -----------------------------
+# FastAPI route
+# -----------------------------
+
+
+@app.post("/analyze")
+async def analyze(file: UploadFile = File(...)):
+    try:
+        contents = await file.read()
+        data = analyze_statement(contents, file.filename)
+        return data
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
