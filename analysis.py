@@ -1,19 +1,143 @@
 import pandas as pd
 import numpy as np
-from io import BytesIO
+from io import BytesIO, StringIO
 import calendar
 from datetime import datetime
 
 
-# ----------------------------------------------------
-# 0. FUTURE / PREDICTION BLOCK
-# ----------------------------------------------------
-def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
-    """
-    Light-weight prediction block based on current month progression
-    and historic behaviour. No heavy ML yet, but shaped like it.
-    """
+# ======================================================
+# 1. LOADING + HEADER DETECTION
+# ======================================================
 
+def _load_raw_table(file_bytes, file_name):
+    """
+    Load CSV / Excel into a raw dataframe with header=None and dtype=str.
+    Handles fully-quoted CSV lines like in dummy_bank - Copy.csv.
+    """
+    name = file_name.lower()
+
+    if name.endswith(".csv"):
+        # Decode bytes to text
+        text = file_bytes.decode("utf-8", errors="ignore")
+        lines = text.splitlines()
+
+        # Detect "every line fully in double quotes" pattern
+        sample = lines[:20]
+        quoted = 0
+        for ln in sample:
+            s = ln.strip()
+            if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+                quoted += 1
+
+        # If majority of the sample lines are fully quoted, strip outer quotes
+        if sample and quoted / len(sample) > 0.6:
+            lines = [
+                ln.strip()[1:-1]
+                if ln.strip().startswith('"') and ln.strip().endswith('"')
+                else ln
+                for ln in lines
+            ]
+            text = "\n".join(lines)
+
+        # Read as raw, header=None so we can detect the real header row
+        df_raw = pd.read_csv(StringIO(text), header=None, dtype=str)
+
+    else:
+        # Excel (.xlsx or .xls) – load everything as raw text, header=None
+        df_raw = pd.read_excel(BytesIO(file_bytes), header=None, dtype=str)
+
+    return df_raw
+
+
+def _guess_header_row(df_raw: pd.DataFrame) -> int:
+    """
+    Heuristic to find the row that looks like the actual header:
+    - contains "date"
+    - and/or something like desc/narration/details/particular
+    - and/or amount/balance/debit/credit
+    """
+    best_idx = 0
+    best_score = -1
+    max_rows = min(30, len(df_raw))
+
+    for i in range(max_rows):
+        row = df_raw.iloc[i].fillna("").astype(str).str.strip().str.lower()
+        non_empty = [c for c in row if c not in ("", "nan", "none")]
+        if not non_empty:
+            continue
+
+        score = 0
+        cells = list(row)
+
+        if any("date" in c for c in cells):
+            score += 3
+
+        if any(
+            any(k in c for k in ("desc", "narrat", "details", "particular", "remark"))
+            for c in cells
+        ):
+            score += 2
+
+        if any(
+            any(
+                k in c
+                for k in (
+                    "amount",
+                    "amt",
+                    "balance",
+                    "debit",
+                    "credit",
+                    "withdraw",
+                    "deposit",
+                )
+            )
+            for c in cells
+        ):
+            score += 2
+
+        if len(non_empty) >= 2:
+            score += 1
+
+        if score > best_score:
+            best_score = score
+            best_idx = i
+
+    return best_idx
+
+
+def _normalize_table(file_bytes, file_name) -> pd.DataFrame:
+    """
+    Returns a dataframe with the correct header row applied and
+    all-empty columns dropped.
+    """
+    df_raw = _load_raw_table(file_bytes, file_name)
+    header_row = _guess_header_row(df_raw)
+
+    header = df_raw.iloc[header_row].fillna("").astype(str).str.strip()
+    df = df_raw.iloc[header_row + 1 :].reset_index(drop=True).copy()
+    df.columns = header
+    df = df.dropna(axis=1, how="all")
+
+    return df
+
+
+def _find_col(df: pd.DataFrame, keywords) -> str | None:
+    """
+    Find first column whose lowercased name contains any of the given keywords.
+    """
+    for c in df.columns:
+        name = str(c).strip().lower()
+        for k in keywords:
+            if k in name:
+                return c
+    return None
+
+
+# ======================================================
+# 2. FUTURE / PREDICTION BLOCK (same behaviour as before)
+# ======================================================
+
+def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
     if df.empty or "date" not in df.columns or "signed_amount" not in df.columns:
         return {
             "predicted_eom_savings": 0.0,
@@ -30,7 +154,6 @@ def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
     if "category" not in df.columns:
         df["category"] = "Others"
 
-    # 1. Identify current & previous months
     current_month = df["month"].max()
     if pd.isna(current_month):
         return {
@@ -57,7 +180,6 @@ def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
     days_in_month = calendar.monthrange(year, month)[1]
     days_elapsed = last_date.day
 
-    # 2. Project end-of-month savings
     inflow_to_date = df_current[df_current["signed_amount"] > 0]["signed_amount"].sum()
     outflow_to_date = -df_current[df_current["signed_amount"] < 0]["signed_amount"].sum()
 
@@ -68,12 +190,9 @@ def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
     projected_outflow = avg_daily_outflow * days_in_month
 
     predicted_eom_savings = float(projected_inflow - projected_outflow)
-
-    # Simple confidence band: ±15%
     low_bound = float(predicted_eom_savings * 0.85)
     high_bound = float(predicted_eom_savings * 1.15)
 
-    # 3. Overspend risk vs safe_daily_spend / history
     monthly_net = (
         df.groupby("month")["signed_amount"]
         .sum()
@@ -116,7 +235,6 @@ def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
         "probability": overspend_prob,
     }
 
-    # 4. Risky categories (where you may overspend)
     if df_prev.empty:
         risky_categories = []
     else:
@@ -179,169 +297,40 @@ def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
     }
 
 
-# ----------------------------------------------------
-# 1. HELPER: LOAD WITH SMART HEADER DETECTION
-# ----------------------------------------------------
-def _load_with_header_detection(file_bytes, file_name: str) -> pd.DataFrame:
-    """
-    Handles messy bank exports (HDFC .xls etc.) which have junk rows
-    before the real header. Detects the header row by scanning the first
-    few rows for typical column names.
-    """
+# ======================================================
+# 3. MAIN ANALYSIS
+# ======================================================
 
-    is_csv = file_name.lower().endswith(".csv")
-
-    # Read raw with NO header
-    if is_csv:
-        raw = pd.read_csv(BytesIO(file_bytes), header=None)
-    else:
-        raw = pd.read_excel(BytesIO(file_bytes), header=None)
-
-    header_row = None
-    max_scan = min(20, len(raw))
-
-    keywords = [
-        "date",
-        "txn",
-        "transaction",
-        "value date",
-        "narration",
-        "description",
-        "details",
-        "withdrawal",
-        "deposit",
-        "debit",
-        "credit",
-        "amount",
-    ]
-
-    for i in range(max_scan):
-        row_values = raw.iloc[i].tolist()
-        row_str = " ".join(str(x).lower() for x in row_values)
-        if any(k in row_str for k in keywords):
-            header_row = i
-            break
-
-    # Fallback: assume first row is header
-    if header_row is None:
-        header_row = 0
-
-    # Re-read file with correct header row
-    if is_csv:
-        df = pd.read_csv(BytesIO(file_bytes), header=header_row)
-    else:
-        df = pd.read_excel(BytesIO(file_bytes), header=header_row)
-
-    return df
-
-
-# ----------------------------------------------------
-# 2. MAIN ENTRY: ANALYZE STATEMENT
-# ----------------------------------------------------
 def analyze_statement(file_bytes, file_name):
-    # 2.1 LOAD FILE (with header detection)
-    df = _load_with_header_detection(file_bytes, file_name)
+    # --- 1) Normalize table & detect key columns ---
+    df = _normalize_table(file_bytes, file_name)
 
-    # 2.2 STANDARDIZE COLUMNS
-    df.columns = df.columns.astype(str).str.strip().str.lower()
+    # standardize header
+    df.columns = df.columns.map(lambda c: str(c).strip().lower())
 
-    # Initial column mapping
-    col_map = {}
-    for c in df.columns:
-        if "date" in c and "value" not in c:
-            col_map.setdefault("date", c)
-        if (
-            "desc" in c
-            or "narration" in c
-            or "particular" in c
-            or "details" in c
-            or "remark" in c
-        ):
-            col_map.setdefault("description", c)
-        if "amount" in c:
-            col_map.setdefault("amount", c)
-        if "type" in c or "cr/dr" in c or "dr/cr" in c:
-            col_map.setdefault("type", c)
+    date_col = _find_col(df, ["date"])
+    desc_col = _find_col(df, ["desc", "narrat", "details", "particular"])
+    amount_col = _find_col(df, ["amount", "amt"])
+    type_col = _find_col(df, ["type", "dr/cr", "cr/dr"])
 
-    df = df.rename(columns=col_map)
-
-    # If description still missing, best-effort fallback
-    if "description" not in df.columns:
-        for fallback in ["narration", "description", "details", "particulars", "remarks"]:
-            if fallback in df.columns:
-                df = df.rename(columns={fallback: "description"})
-                break
-
-    # 2.3 HDFC-style DEBIT / CREDIT COLUMNS -> single "amount"
-    if "amount" not in df.columns:
-        debit_candidates = [
-            c
-            for c in df.columns
-            if any(
-                key in c
-                for key in [
-                    "debit",
-                    "withdrawal",
-                    "withdr",
-                    "wdl",
-                    "dr",
-                    "withdrawal amt",
-                ]
-            )
-        ]
-        credit_candidates = [
-            c
-            for c in df.columns
-            if any(
-                key in c
-                for key in [
-                    "credit",
-                    "deposit",
-                    "cr",
-                    "cr.",
-                    "deposit amt",
-                ]
-            )
-        ]
-
-        debit_col = debit_candidates[0] if debit_candidates else None
-        credit_col = credit_candidates[0] if credit_candidates else None
-
-        if debit_col or credit_col:
-            for col in [debit_col, credit_col]:
-                if col and col in df.columns:
-                    df[col] = (
-                        df[col]
-                        .astype(str)
-                        .str.replace(",", "", regex=False)
-                        .str.replace("₹", "", regex=False)
-                        .str.strip()
-                    )
-                    df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
-
-            debit_vals = df[debit_col] if debit_col else 0.0
-            credit_vals = df[credit_col] if credit_col else 0.0
-
-            # Positive for credit, negative for debit
-            df["amount"] = credit_vals - debit_vals
-            df["type"] = np.where(df["amount"] >= 0, "CR", "DR")
-
-    # 2.4 Ensure existence of core fields
-    if "date" not in df.columns:
-        # FRONTEND expects this message
+    if date_col is None:
         raise Exception("Missing required date column.")
+    if desc_col is None:
+        raise Exception("Missing required description / narration column.")
+    if amount_col is None:
+        raise Exception("Missing required amount column.")
 
-    if "description" not in df.columns:
-        raise Exception("Missing required transaction description column.")
+    col_ren = {
+        date_col: "date",
+        desc_col: "description",
+        amount_col: "amount",
+    }
+    if type_col is not None:
+        col_ren[type_col] = "type"
 
-    if "amount" not in df.columns:
-        raise Exception(
-            "Missing required amount information. Looked for 'amount' or debit/credit columns."
-        )
+    df = df.rename(columns=col_ren)
 
-    # ------------------------------------------------
-    # 3. CLEAN DATE + AMOUNT
-    # ------------------------------------------------
+    # --- 2) Clean date & amount ---
     df["date"] = pd.to_datetime(df["date"], dayfirst=True, errors="coerce")
 
     df["amount"] = (
@@ -349,36 +338,22 @@ def analyze_statement(file_bytes, file_name):
         .astype(str)
         .str.replace(",", "", regex=False)
         .str.replace("₹", "", regex=False)
-        .str.strip()
     )
     df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
 
-    # ------------------------------------------------
-    # 4. SIGNED AMOUNT
-    # ------------------------------------------------
     if "type" in df.columns:
         df["type"] = df["type"].astype(str).str.upper()
-
-        def _signed(row):
-            t = str(row.get("type", "")).upper()
-            amt = row["amount"]
-            if t in ("CR", "CREDIT", "C"):
-                return amt
-            elif t in ("DR", "DEBIT", "D"):
-                return -abs(amt)
-            return amt
-
-        df["signed_amount"] = df.apply(_signed, axis=1)
+        df["signed_amount"] = df.apply(
+            lambda row: row["amount"] if row["type"] == "CR" else -abs(row["amount"]),
+            axis=1,
+        )
     else:
         df["signed_amount"] = df["amount"]
 
-    # Drop obviously invalid rows
     df = df.dropna(subset=["date", "signed_amount"])
     df = df.sort_values("date")
 
-    # ------------------------------------------------
-    # 5. BASIC CATEGORY MAPPING (RULE-BASED)
-    # ------------------------------------------------
+    # --- 3) Simple category tagging (rule-based) ---
     def detect_category(desc):
         d = str(desc).lower()
 
@@ -400,19 +375,15 @@ def analyze_statement(file_bytes, file_name):
 
         return "Others"
 
-    df["category"] = df.get("description", "").astype(str).apply(detect_category)
+    df["category"] = df["description"].astype(str).apply(detect_category)
 
-    # ------------------------------------------------
-    # 6. AGGREGATES & METRICS
-    # ------------------------------------------------
+    # --- 4) Aggregates ---
     df["month"] = df["date"].dt.to_period("M")
 
-    # Total inflow/outflow
     inflow = df[df["signed_amount"] > 0]["signed_amount"].sum()
     outflow = df[df["signed_amount"] < 0]["signed_amount"].abs().sum()
     net_savings = inflow - outflow
 
-    # Monthly savings
     monthly = df.groupby("month")["signed_amount"].sum().reset_index()
     monthly["month"] = monthly["month"].astype(str)
 
@@ -427,10 +398,10 @@ def analyze_statement(file_bytes, file_name):
         prev_savings = df[df["month"] == prev_month]["signed_amount"].sum()
         mom_change = this_month_savings - prev_savings
     else:
-        prev_savings = 0.0
-        mom_change = 0.0
+        prev_savings = 0
+        mom_change = 0
 
-    # UPI outflow
+    # --- 5) UPI metrics ---
     upi_mask = df["description"].astype(str).str.lower().str.contains("upi")
     upi_df = df[(upi_mask) & (df["signed_amount"] < 0)]
     upi_total = upi_df["signed_amount"].abs().sum()
@@ -449,14 +420,14 @@ def analyze_statement(file_bytes, file_name):
     else:
         top_upi_handle = None
 
-    # EMI load
+    # --- 6) EMI load ---
     emi_df = df[df["category"] == "Emi"]
     emi_month_df = emi_df[emi_df["month"] == latest_month]
 
     emi_load = emi_month_df["signed_amount"].abs().sum()
     emi_months = emi_df["month"].nunique()
 
-    # Category summary (for donut chart)
+    # --- 7) Category summary for donut ---
     cat_summary = (
         df[df["signed_amount"] < 0]
         .groupby("category")["signed_amount"]
@@ -465,24 +436,18 @@ def analyze_statement(file_bytes, file_name):
         .reset_index()
     ).sort_values("signed_amount", ascending=False)
 
-    # Safe daily spend (simple version)
-    safe_daily = max(0.0, this_month_savings) / 30
+    # --- 8) Safe daily spend ---
+    safe_daily = max(0, this_month_savings) / 30
 
-    # ------------------------------------------------
-    # 7. FUTURE / PREDICTION BLOCK
-    # ------------------------------------------------
+    # --- 9) Future / prediction block ---
     future_block = build_future_block(df, safe_daily)
 
-    # ------------------------------------------------
-    # 8. CLEANED CSV EXPORT
-    # ------------------------------------------------
+    # --- 10) Cleaned CSV export ---
     cleaned_export = df[["date", "description", "signed_amount", "category"]].copy()
     cleaned_export["date"] = cleaned_export["date"].astype(str)
     csv_output = cleaned_export.to_csv(index=False)
 
-    # ------------------------------------------------
-    # 9. BUILD RESULT JSON
-    # ------------------------------------------------
+    # --- 11) Final JSON ---
     result = {
         "summary": {
             "inflow": inflow,
