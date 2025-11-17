@@ -12,3 +12,6 @@ scikit-learn
 joblib
 openai
 groq
+pdfplumber
+pillow
+pypdfium2
