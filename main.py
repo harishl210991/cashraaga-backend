@@ -32,6 +32,20 @@ if genai is not None and GEMINI_API_KEY:
 else:
     GEMINI_AVAILABLE = False
 
+# ----- Optional Groq client -----
+try:
+    from groq import Groq  # type: ignore
+except ImportError:
+    Groq = None
+
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+if Groq is not None and GROQ_API_KEY:
+    groq_client = Groq(api_key=GROQ_API_KEY)
+    GROQ_AVAILABLE = True
+else:
+    groq_client = None
+    GROQ_AVAILABLE = False
+
 
 @app.get("/health")
 def health_check():
@@ -171,8 +185,27 @@ def build_rule_based_reply(message: str, analysis: dict | None) -> str:
     # -------------------------
     category_map = {
         "medical": ["medical", "hospital", "pharmacy", "clinic", "doctor"],
-        "food & dining": ["food", "eating", "restaurant", "swiggy", "zomato", "lunch", "dinner", "breakfast"],
-        "fuel & transport": ["fuel", "petrol", "diesel", "transport", "cab", "uber", "ola", "bus", "train"],
+        "food & dining": [
+            "food",
+            "eating",
+            "restaurant",
+            "swiggy",
+            "zomato",
+            "lunch",
+            "dinner",
+            "breakfast",
+        ],
+        "fuel & transport": [
+            "fuel",
+            "petrol",
+            "diesel",
+            "transport",
+            "cab",
+            "uber",
+            "ola",
+            "bus",
+            "train",
+        ],
         "shopping": ["shopping", "amazon", "flipkart", "myntra", "purchase"],
         "subscriptions": ["subscription", "subscriptions", "netflix", "hotstar", "prime", "ott"],
         "emi": ["emi", "loan"],
@@ -309,6 +342,7 @@ def build_rule_based_reply(message: str, analysis: dict | None) -> str:
         "• UPI spend share"
     )
 
+
 @app.post("/chat")
 async def chat_endpoint(payload: ChatRequest):
     """
@@ -316,8 +350,9 @@ async def chat_endpoint(payload: ChatRequest):
 
     Flow:
     - build_rule_based_reply() computes correct numeric answer (category/month/risk/etc.)
-    - If Gemini is available, it rephrases that answer nicely, without changing numbers.
-    - If Gemini is not available or errors, we return the rule-based answer directly.
+    - Try Groq first (fast) to rephrase the answer.
+    - If Groq is unavailable or errors, try Gemini.
+    - If everything fails, return the rule-based answer directly.
     """
     # Compact JSON snippet just for context (not used for math)
     analysis_snippet = ""
@@ -330,10 +365,7 @@ async def chat_endpoint(payload: ChatRequest):
     # Always compute numeric-safe helper answer
     tool_answer = build_rule_based_reply(payload.message, payload.analysis)
 
-    # If Gemini is not available, just return the tool answer
-    if not GEMINI_AVAILABLE:
-        return {"reply": tool_answer}
-
+    # Common system + user prompts
     system_prompt = (
         "You are CashRaaga, a friendly Indian personal finance coach. "
         "You receive: (1) a JSON summary of the user's bank statement, "
@@ -355,18 +387,40 @@ Helper answer with correct numbers (do not alter any numeric values):
 {tool_answer}
 """
 
-    try:
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        response = model.generate_content(
-            [
-                system_prompt,
-                user_prompt,
-            ]
-        )
-        reply = response.text or ""
-        if not reply.strip():
-            reply = tool_answer
-        return {"reply": reply}
-    except Exception as e:
-        # If Gemini errors, we still fall back to safe numeric answer
-        return {"reply": tool_answer, "note": f"Gemini error: {str(e)}"}
+    # -------- Try Groq first (speed) --------
+    if GROQ_AVAILABLE and groq_client is not None:
+        try:
+            completion = groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.3,
+            )
+            reply = completion.choices[0].message.content or ""
+            if reply.strip():
+                return {"reply": reply}
+        except Exception:
+            # fall through to Gemini
+            pass
+
+    # -------- Then try Gemini (stability) --------
+    if GEMINI_AVAILABLE and genai is not None:
+        try:
+            model = genai.GenerativeModel("gemini-1.5-flash")
+            response = model.generate_content(
+                [
+                    system_prompt,
+                    user_prompt,
+                ]
+            )
+            reply = response.text or ""
+            if reply.strip():
+                return {"reply": reply}
+        except Exception as e:
+            # final fallback below
+            return {"reply": tool_answer, "note": f\"Groq+Gemini error: {str(e)}\"}
+
+    # -------- Final fallback: rule-based only --------
+    return {"reply": tool_answer}
