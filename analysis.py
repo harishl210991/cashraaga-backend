@@ -5,22 +5,16 @@ import calendar
 from datetime import datetime
 
 
+# ----------------------------------------------------
+# 0. FUTURE / PREDICTION BLOCK
+# ----------------------------------------------------
 def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
     """
     Light-weight prediction block based on current month progression
     and historic behaviour. No heavy ML yet, but shaped like it.
     """
 
-    if df.empty:
-        return {
-            "predicted_eom_savings": 0.0,
-            "predicted_eom_range": [0.0, 0.0],
-            "overspend_risk": {"level": "low", "probability": 0.0},
-            "risky_categories": [],
-        }
-
-    # Ensure we have required fields
-    if "date" not in df.columns or "signed_amount" not in df.columns:
+    if df.empty or "date" not in df.columns or "signed_amount" not in df.columns:
         return {
             "predicted_eom_savings": 0.0,
             "predicted_eom_range": [0.0, 0.0],
@@ -36,9 +30,7 @@ def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
     if "category" not in df.columns:
         df["category"] = "Others"
 
-    # -----------------------------
     # 1. Identify current & previous months
-    # -----------------------------
     current_month = df["month"].max()
     if pd.isna(current_month):
         return {
@@ -65,9 +57,7 @@ def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
     days_in_month = calendar.monthrange(year, month)[1]
     days_elapsed = last_date.day
 
-    # -----------------------------
     # 2. Project end-of-month savings
-    # -----------------------------
     inflow_to_date = df_current[df_current["signed_amount"] > 0]["signed_amount"].sum()
     outflow_to_date = -df_current[df_current["signed_amount"] < 0]["signed_amount"].sum()
 
@@ -83,10 +73,7 @@ def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
     low_bound = float(predicted_eom_savings * 0.85)
     high_bound = float(predicted_eom_savings * 1.15)
 
-    # -----------------------------
     # 3. Overspend risk vs safe_daily_spend / history
-    # -----------------------------
-    # Monthly net savings history
     monthly_net = (
         df.groupby("month")["signed_amount"]
         .sum()
@@ -94,7 +81,6 @@ def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
         .sort_values("month")
     )
 
-    # Overspend risk: either vs safe_daily_spend or vs typical net savings
     if safe_daily_spend and safe_daily_spend > 0:
         projected_budget_outflow = safe_daily_spend * days_in_month
         if projected_budget_outflow <= 0:
@@ -102,7 +88,6 @@ def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
         else:
             ratio = projected_outflow / projected_budget_outflow
     else:
-        # Compare predicted savings to average of previous 3 months
         prev_months = monthly_net[monthly_net["month"] < current_month]
         if not prev_months.empty:
             last3 = prev_months["signed_amount"].iloc[-3:]
@@ -113,7 +98,9 @@ def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
         if avg_net_last3 == 0:
             ratio = 1.0
         else:
-            ratio = max(0.0, (avg_net_last3 - predicted_eom_savings) / abs(avg_net_last3))
+            ratio = max(
+                0.0, (avg_net_last3 - predicted_eom_savings) / abs(avg_net_last3)
+            )
 
     overspend_prob = float(max(0.0, min(1.0, ratio)))
 
@@ -129,13 +116,10 @@ def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
         "probability": overspend_prob,
     }
 
-    # -----------------------------
     # 4. Risky categories (where you may overspend)
-    # -----------------------------
     if df_prev.empty:
         risky_categories = []
     else:
-        # Average monthly outflow per category from previous months
         prev_months_count = max(df_prev["month"].nunique(), 1)
 
         prev_cat = (
@@ -148,7 +132,6 @@ def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
         )
         prev_cat["baseline_outflow"] = prev_cat["total_outflow_prev"] / prev_months_count
 
-        # Current month outflow to date per category
         curr_cat = (
             df_current[df_current["signed_amount"] < 0]
             .assign(outflow=lambda x: -x["signed_amount"])
@@ -196,49 +179,114 @@ def build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
     }
 
 
-def analyze_statement(file_bytes, file_name):
-    # -----------------------------
-    # 1. LOAD FILE
-    # -----------------------------
-    if file_name.lower().endswith(".csv"):
-        df = pd.read_csv(BytesIO(file_bytes))
+# ----------------------------------------------------
+# 1. HELPER: LOAD WITH SMART HEADER DETECTION
+# ----------------------------------------------------
+def _load_with_header_detection(file_bytes, file_name: str) -> pd.DataFrame:
+    """
+    Handles messy bank exports (HDFC .xls etc.) which have junk rows
+    before the real header. Detects the header row by scanning the first
+    few rows for typical column names.
+    """
+
+    is_csv = file_name.lower().endswith(".csv")
+
+    # Read raw with NO header
+    if is_csv:
+        raw = pd.read_csv(BytesIO(file_bytes), header=None)
     else:
-        df = pd.read_excel(BytesIO(file_bytes))
+        raw = pd.read_excel(BytesIO(file_bytes), header=None)
 
-    # -----------------------------
-    # 2. STANDARDIZE COLUMNS
-    # -----------------------------
-    df.columns = df.columns.str.strip().str.lower()
+    header_row = None
+    max_scan = min(20, len(raw))
 
-    # map obvious ones first
+    keywords = [
+        "date",
+        "txn",
+        "transaction",
+        "value date",
+        "narration",
+        "description",
+        "details",
+        "withdrawal",
+        "deposit",
+        "debit",
+        "credit",
+        "amount",
+    ]
+
+    for i in range(max_scan):
+        row_values = raw.iloc[i].tolist()
+        row_str = " ".join(str(x).lower() for x in row_values)
+        if any(k in row_str for k in keywords):
+            header_row = i
+            break
+
+    # Fallback: assume first row is header
+    if header_row is None:
+        header_row = 0
+
+    # Re-read file with correct header row
+    if is_csv:
+        df = pd.read_csv(BytesIO(file_bytes), header=header_row)
+    else:
+        df = pd.read_excel(BytesIO(file_bytes), header=header_row)
+
+    return df
+
+
+# ----------------------------------------------------
+# 2. MAIN ENTRY: ANALYZE STATEMENT
+# ----------------------------------------------------
+def analyze_statement(file_bytes, file_name):
+    # 2.1 LOAD FILE (with header detection)
+    df = _load_with_header_detection(file_bytes, file_name)
+
+    # 2.2 STANDARDIZE COLUMNS
+    df.columns = df.columns.astype(str).str.strip().str.lower()
+
+    # Initial column mapping
     col_map = {}
     for c in df.columns:
         if "date" in c and "value" not in c:
             col_map.setdefault("date", c)
-        if "desc" in c or "narration" in c or "particular" in c or "details" in c:
+        if (
+            "desc" in c
+            or "narration" in c
+            or "particular" in c
+            or "details" in c
+            or "remark" in c
+        ):
             col_map.setdefault("description", c)
         if "amount" in c:
             col_map.setdefault("amount", c)
-        if "type" in c or "cr/dr" in c:
+        if "type" in c or "cr/dr" in c or "dr/cr" in c:
             col_map.setdefault("type", c)
 
     df = df.rename(columns=col_map)
 
-    # if description still missing, fall back to any column that looks text-y
+    # If description still missing, best-effort fallback
     if "description" not in df.columns:
-        for fallback in ["narration", "description", "details", "particulars"]:
+        for fallback in ["narration", "description", "details", "particulars", "remarks"]:
             if fallback in df.columns:
                 df = df.rename(columns={fallback: "description"})
                 break
 
-    # --- HDFC-style debit / credit columns -> single "amount" + "type" ---
+    # 2.3 HDFC-style DEBIT / CREDIT COLUMNS -> single "amount"
     if "amount" not in df.columns:
         debit_candidates = [
             c
             for c in df.columns
             if any(
                 key in c
-                for key in ["debit", "withdrawal", "withdr", "wdl", "dr", "withdrawal amt"]
+                for key in [
+                    "debit",
+                    "withdrawal",
+                    "withdr",
+                    "wdl",
+                    "dr",
+                    "withdrawal amt",
+                ]
             )
         ]
         credit_candidates = [
@@ -246,7 +294,13 @@ def analyze_statement(file_bytes, file_name):
             for c in df.columns
             if any(
                 key in c
-                for key in ["credit", "deposit", "cr", "cr.", "deposit amt"]
+                for key in [
+                    "credit",
+                    "deposit",
+                    "cr",
+                    "cr.",
+                    "deposit amt",
+                ]
             )
         ]
 
@@ -254,7 +308,6 @@ def analyze_statement(file_bytes, file_name):
         credit_col = credit_candidates[0] if credit_candidates else None
 
         if debit_col or credit_col:
-            # clean raw numbers on those cols
             for col in [debit_col, credit_col]:
                 if col and col in df.columns:
                     df[col] = (
@@ -269,28 +322,28 @@ def analyze_statement(file_bytes, file_name):
             debit_vals = df[debit_col] if debit_col else 0.0
             credit_vals = df[credit_col] if credit_col else 0.0
 
-            # positive = credit, negative = debit
+            # Positive for credit, negative for debit
             df["amount"] = credit_vals - debit_vals
-
-            # build a crude type column so later signed_amount logic works
             df["type"] = np.where(df["amount"] >= 0, "CR", "DR")
 
-    # Ensure existence of core fields
+    # 2.4 Ensure existence of core fields
     if "date" not in df.columns:
+        # FRONTEND expects this message
         raise Exception("Missing required date column.")
+
     if "description" not in df.columns:
         raise Exception("Missing required transaction description column.")
+
     if "amount" not in df.columns:
         raise Exception(
             "Missing required amount information. Looked for 'amount' or debit/credit columns."
         )
 
-    # -----------------------------
+    # ------------------------------------------------
     # 3. CLEAN DATE + AMOUNT
-    # -----------------------------
+    # ------------------------------------------------
     df["date"] = pd.to_datetime(df["date"], dayfirst=True, errors="coerce")
 
-    # if CSV has commas or ₹ symbol in amount column
     df["amount"] = (
         df["amount"]
         .astype(str)
@@ -300,9 +353,9 @@ def analyze_statement(file_bytes, file_name):
     )
     df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
 
-    # -----------------------------
+    # ------------------------------------------------
     # 4. SIGNED AMOUNT
-    # -----------------------------
+    # ------------------------------------------------
     if "type" in df.columns:
         df["type"] = df["type"].astype(str).str.upper()
 
@@ -313,23 +366,19 @@ def analyze_statement(file_bytes, file_name):
                 return amt
             elif t in ("DR", "DEBIT", "D"):
                 return -abs(amt)
-            # fallback: sign based on amount itself
             return amt
 
         df["signed_amount"] = df.apply(_signed, axis=1)
     else:
-        # If no type column exists, assume sign of amount is already correct
         df["signed_amount"] = df["amount"]
 
-    # Remove invalid rows
+    # Drop obviously invalid rows
     df = df.dropna(subset=["date", "signed_amount"])
-
-    # Sort properly
     df = df.sort_values("date")
 
-    # -----------------------------
-    # 5. CATEGORY MAPPING
-    # -----------------------------
+    # ------------------------------------------------
+    # 5. BASIC CATEGORY MAPPING (RULE-BASED)
+    # ------------------------------------------------
     def detect_category(desc):
         d = str(desc).lower()
 
@@ -353,46 +402,39 @@ def analyze_statement(file_bytes, file_name):
 
     df["category"] = df.get("description", "").astype(str).apply(detect_category)
 
-    # -----------------------------
-    # 6. AGGREGATES
-    # -----------------------------
+    # ------------------------------------------------
+    # 6. AGGREGATES & METRICS
+    # ------------------------------------------------
     df["month"] = df["date"].dt.to_period("M")
 
-    # TOTAL INFLOW / OUTFLOW
+    # Total inflow/outflow
     inflow = df[df["signed_amount"] > 0]["signed_amount"].sum()
     outflow = df[df["signed_amount"] < 0]["signed_amount"].abs().sum()
     net_savings = inflow - outflow
 
-    # -----------------------------
-    # 7. MONTHLY SAVINGS
-    # -----------------------------
+    # Monthly savings
     monthly = df.groupby("month")["signed_amount"].sum().reset_index()
     monthly["month"] = monthly["month"].astype(str)
 
-    # Latest month
     latest_month = df["month"].max()
     latest_month_str = str(latest_month)
 
     this_month_df = df[df["month"] == latest_month]
     this_month_savings = this_month_df["signed_amount"].sum()
 
-    # Compare to previous month
     prev_month = latest_month - 1
     if prev_month in df["month"].unique():
         prev_savings = df[df["month"] == prev_month]["signed_amount"].sum()
         mom_change = this_month_savings - prev_savings
     else:
-        prev_savings = 0
-        mom_change = 0
+        prev_savings = 0.0
+        mom_change = 0.0
 
-    # -----------------------------
-    # 8. UPI OUTFLOW
-    # -----------------------------
+    # UPI outflow
     upi_mask = df["description"].astype(str).str.lower().str.contains("upi")
     upi_df = df[(upi_mask) & (df["signed_amount"] < 0)]
     upi_total = upi_df["signed_amount"].abs().sum()
 
-    # Latest month UPI
     upi_month_df = upi_df[upi_df["month"] == latest_month]
     upi_month_total = upi_month_df["signed_amount"].abs().sum()
 
@@ -407,18 +449,14 @@ def analyze_statement(file_bytes, file_name):
     else:
         top_upi_handle = None
 
-    # -----------------------------
-    # 9. EMI LOAD
-    # -----------------------------
+    # EMI load
     emi_df = df[df["category"] == "Emi"]
     emi_month_df = emi_df[emi_df["month"] == latest_month]
 
     emi_load = emi_month_df["signed_amount"].abs().sum()
     emi_months = emi_df["month"].nunique()
 
-    # -----------------------------
-    # 10. CATEGORY SUMMARY (DONUT)
-    # -----------------------------
+    # Category summary (for donut chart)
     cat_summary = (
         df[df["signed_amount"] < 0]
         .groupby("category")["signed_amount"]
@@ -427,28 +465,24 @@ def analyze_statement(file_bytes, file_name):
         .reset_index()
     ).sort_values("signed_amount", ascending=False)
 
-    # -----------------------------
-    # 11. SAFE DAILY SPEND
-    # -----------------------------
-    # safe spend = (this month savings) / 30 (if positive)
-    safe_daily = max(0, this_month_savings) / 30
+    # Safe daily spend (simple version)
+    safe_daily = max(0.0, this_month_savings) / 30
 
-    # -----------------------------
-    # 12. FUTURE / PREDICTION BLOCK
-    # -----------------------------
+    # ------------------------------------------------
+    # 7. FUTURE / PREDICTION BLOCK
+    # ------------------------------------------------
     future_block = build_future_block(df, safe_daily)
 
-    # -----------------------------
-    # 13. CLEANED CSV EXPORT
-    # -----------------------------
+    # ------------------------------------------------
+    # 8. CLEANED CSV EXPORT
+    # ------------------------------------------------
     cleaned_export = df[["date", "description", "signed_amount", "category"]].copy()
     cleaned_export["date"] = cleaned_export["date"].astype(str)
-
     csv_output = cleaned_export.to_csv(index=False)
 
-    # -----------------------------
-    # 14. BUILD RESULT JSON
-    # -----------------------------
+    # ------------------------------------------------
+    # 9. BUILD RESULT JSON
+    # ------------------------------------------------
     result = {
         "summary": {
             "inflow": inflow,
@@ -474,7 +508,6 @@ def analyze_statement(file_bytes, file_name):
         "monthly_savings": monthly.to_dict(orient="records"),
         "category_summary": cat_summary.to_dict(orient="records"),
         "cleaned_csv": csv_output,
-        # NEW: ML-style predictions block
         "future_block": future_block,
     }
 
