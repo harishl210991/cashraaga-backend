@@ -420,7 +420,7 @@ Helper answer with correct numbers (do not alter any numeric values):
                 return {"reply": reply}
         except Exception as e:
             # final fallback below
-            return {"reply": tool_answer, "note": f\"Groq+Gemini error: {str(e)}\"}
+            return {"reply": tool_answer, "note": f"Groq+Gemini error: {str(e)}"}
 
     # -------- Final fallback: rule-based only --------
     return {"reply": tool_answer}
