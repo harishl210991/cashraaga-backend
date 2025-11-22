@@ -1,82 +1,141 @@
-import pandas as pd
-import numpy as np
-from io import BytesIO, StringIO
+import os
 import calendar
+from io import BytesIO, StringIO
+
+import numpy as np
+import pandas as pd
 import pdfplumber
+import joblib
+
+# These imports are needed so joblib can unpickle sklearn Pipelines
+from sklearn.feature_extraction.text import TfidfVectorizer  # noqa: F401
+from sklearn.pipeline import Pipeline  # noqa: F401
+from sklearn.linear_model import LogisticRegression  # noqa: F401
+from sklearn.ensemble import RandomForestRegressor  # noqa: F401
 
 
-# ---------------------------- RAW LOADER ----------------------------
+# ---------------------------------------------------------------------------
+# MODEL PATHS
+# ---------------------------------------------------------------------------
 
-def _load_raw(file_bytes, file_name):
+BANK_MODEL_PATH = os.getenv("CASHRAAGA_BANK_MODEL", "bank_template_model.joblib")
+CATEGORY_MODEL_PATH = os.getenv("CASHRAAGA_CATEGORY_MODEL", "category_model.joblib")
+SAVINGS_MODEL_PATH = os.getenv("CASHRAAGA_SAVINGS_MODEL", "savings_model.joblib")
+
+
+_bank_model = None
+_bank_model_loaded = False
+
+_category_model = None
+_category_model_loaded = False
+
+_savings_model = None
+_savings_model_loaded = False
+
+
+def _get_bank_model():
+    global _bank_model, _bank_model_loaded
+    if _bank_model_loaded:
+        return _bank_model
+    _bank_model_loaded = True
+    try:
+        if os.path.exists(BANK_MODEL_PATH):
+            _bank_model = joblib.load(BANK_MODEL_PATH)
+    except Exception:
+        _bank_model = None
+    return _bank_model
+
+
+def _get_category_model():
+    global _category_model, _category_model_loaded
+    if _category_model_loaded:
+        return _category_model
+    _category_model_loaded = True
+    try:
+        if os.path.exists(CATEGORY_MODEL_PATH):
+            _category_model = joblib.load(CATEGORY_MODEL_PATH)
+    except Exception:
+        _category_model = None
+    return _category_model
+
+
+def _get_savings_model():
+    global _savings_model, _savings_model_loaded
+    if _savings_model_loaded:
+        return _savings_model
+    _savings_model_loaded = True
+    try:
+        if os.path.exists(SAVINGS_MODEL_PATH):
+            _savings_model = joblib.load(SAVINGS_MODEL_PATH)
+    except Exception:
+        _savings_model = None
+    return _savings_model
+
+
+# ---------------------------------------------------------------------------
+# RAW LOADER
+# ---------------------------------------------------------------------------
+
+
+def _load_raw(file_bytes: bytes, file_name: str) -> pd.DataFrame:
+    """
+    Load CSV / Excel into a raw grid (no headers).
+    """
     name = (file_name or "").lower()
 
     if name.endswith(".csv"):
-        # Read raw text
         text = file_bytes.decode("utf-8", errors="ignore")
-        lines = text.splitlines()
-
-        # Detect "whole row wrapped in quotes" pattern
-        sample = lines[:20]
-        quoted = 0
-        for ln in sample:
-            s = ln.strip()
-            if len(s) >= 2 and s[0] == '"' and s[-1] == '"' and s.count('"') == 2:
-                quoted += 1
-
-        # If most lines are like "Date,Description,Amount,Type"
-        if quoted >= max(1, len(sample) // 2):
-            lines = [ln.strip().strip('"') for ln in lines]
-            text = "\n".join(lines)
-
-        df_raw = pd.read_csv(StringIO(text), header=None)
+        # header=None to keep the header row as data
+        df_raw = pd.read_csv(StringIO(text), header=None, dtype=str)
         return df_raw
 
-    elif name.endswith(".xls") or name.endswith(".xlsx"):
-        # Read everything as data, we will find the header later
-        return pd.read_excel(BytesIO(file_bytes), header=None)
+    if name.endswith(".xlsx") or name.endswith(".xls"):
+        df_raw = pd.read_excel(BytesIO(file_bytes), header=None, dtype=str)
+        return df_raw
 
-    # Fallback: try CSV then Excel
-    try:
-        return pd.read_csv(BytesIO(file_bytes), header=None)
-    except Exception:
-        return pd.read_excel(BytesIO(file_bytes), header=None)
+    raise Exception(f"Unsupported file type for _load_raw: {file_name}")
 
 
-# ---------------------------- HEADER & TABLE EXTRACTION ----------------------------
+# ---------------------------------------------------------------------------
+# HEADER ROW DETECTION
+# ---------------------------------------------------------------------------
 
-def _find_header_row(df_raw):
+
+def _find_header_row(df_raw: pd.DataFrame) -> int | None:
     """
-    Scan first ~60 rows and find the row that looks most like the header:
-    containing words like date, narration, amount, withdraw, deposit, etc.
-    Works for both dummy CSV and HDFC XLS (header around row 20).
+    Heuristic to find the most likely header row in the first ~60 rows.
+    Scores rows by presence of common header tokens.
     """
-    KEYWORDS = [
-        "date",
-        "narration",
-        "remark",
-        "description",
-        "details",
-        "withdraw",
-        "deposit",
-        "debit",
-        "credit",
-        "amount",
-        "balance",
-    ]
-
     best_idx = None
     best_score = -1
 
-    for i in range(min(60, len(df_raw))):
-        row = df_raw.iloc[i].fillna("").astype(str).str.lower().tolist()
-        nonempty = [c for c in row if c.strip() != ""]
-        if not nonempty:
+    max_rows = min(60, len(df_raw))
+
+    for i in range(max_rows):
+        row = df_raw.iloc[i]
+        non_empty = row.notna().sum()
+        if non_empty < 2:
+            continue
+
+        tokens = [str(x).strip().lower() for x in row if str(x).strip()]
+        if not tokens:
             continue
 
         score = 0
-        for cell in row:
-            if any(k in cell for k in KEYWORDS):
+        for t in tokens:
+            if any(k in t for k in ["date", "value dt", "txn date", "transaction date"]):
+                score += 2
+            if any(k in t for k in ["narrat", "remark", "descr", "details", "particular"]):
+                score += 2
+            if any(k in t for k in ["withdraw", "debit"]):
                 score += 1
+            if any(k in t for k in ["deposit", "credit"]):
+                score += 1
+            if "balance" in t:
+                score += 1
+
+        if 3 <= len(tokens) <= 10:
+            score += 1
 
         if score > best_score:
             best_score = score
@@ -85,10 +144,10 @@ def _find_header_row(df_raw):
     return best_idx
 
 
-def _extract_table(df_raw):
+def _extract_table(df_raw: pd.DataFrame) -> pd.DataFrame:
     """
-    From a raw grid (no headers) -> use the detected header row to create a
-    proper dataframe with named columns.
+    From a raw grid (no headers) -> use the detected header row
+    to create a proper dataframe with named columns.
     """
     hdr = _find_header_row(df_raw)
     if hdr is None:
@@ -101,19 +160,111 @@ def _extract_table(df_raw):
     return data
 
 
-# ---------------------------- CANONICALIZATION ----------------------------
+# ---------------------------------------------------------------------------
+# BANK TEMPLATE DETECTION
+# ---------------------------------------------------------------------------
 
-def _canonicalize_table(df_in):
+
+def _predict_bank_from_filename(file_name: str) -> str | None:
     """
-    Convert any "Date / Narration / Debit / Credit / Amount / Type" layout
-    into a canonical dataframe with columns:
-    - date
-    - description
-    - signed_amount  (+ = inflow, - = outflow)
+    Quick heuristics based on file name.
+    """
+    name = (file_name or "").lower()
+    if "icici" in name:
+        return "ICICI"
+    if "hdfc" in name:
+        return "HDFC"
+    if "axis" in name:
+        return "AXIS"
+    if "kotak" in name:
+        return "KOTAK"
+    if "sbi" in name or "state bank" in name:
+        return "SBI"
+    if "hsbc" in name:
+        return "HSBC"
+    return None
+
+
+def _predict_bank_template(df_raw: pd.DataFrame | None, file_name: str) -> str | None:
+    """
+    Hybrid detection:
+    1. Filename heuristics
+    2. ML model (if available) using first few rows as text
+    """
+    # 1) filename
+    bank = _predict_bank_from_filename(file_name)
+    if bank:
+        return bank
+
+    # 2) ML model
+    model = _get_bank_model()
+    if model is None or df_raw is None or df_raw.empty:
+        return None
+
+    snippet_rows = []
+    max_rows = min(10, len(df_raw))
+    for i in range(max_rows):
+        row = df_raw.iloc[i].fillna("").astype(str).tolist()
+        snippet_rows.append(" | ".join(row))
+
+    text = (file_name or "").lower() + "\n" + "\n".join(snippet_rows)
+
+    try:
+        pred = model.predict([text])[0]
+        return str(pred)
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# CANONICALIZATION (DATE / DESCRIPTION / SIGNED_AMOUNT)
+# ---------------------------------------------------------------------------
+
+
+def _canonicalize_table(df_in: pd.DataFrame, bank_type: str | None = None) -> pd.DataFrame:
+    """
+    Normalize various bank formats into a standard schema:
+
+    - date (datetime64[ns])
+    - description (string)
+    - signed_amount (float)  (+ = inflow, - = outflow)
     """
     df = df_in.copy()
     df.columns = [str(c).strip() for c in df.columns]
     cols = list(df.columns)
+
+    bank_type = (bank_type or "").upper()
+
+    # Bank-specific hints
+    if bank_type == "ICICI":
+        date_keys = ["date", "value date", "txn date", "transaction date"]
+        desc_keys = ["transaction remarks", "narration", "description", "details", "particular"]
+        debit_keys = ["withdrawal amt", "withdrawal", "debit"]
+        credit_keys = ["deposit amt", "deposit", "credit"]
+        amount_keys = ["amount", "amt"]
+        type_keys = ["type", "dr/cr"]
+    elif bank_type == "HDFC":
+        date_keys = ["date", "value dt"]
+        desc_keys = ["narration", "description", "details", "particular"]
+        debit_keys = ["withdrawal amt", "debit amt", "withdrawal", "debit"]
+        credit_keys = ["deposit amt", "credit amt", "deposit", "credit"]
+        amount_keys = ["amount", "amt"]
+        type_keys = ["type", "chq./ref.no.", "dr/cr"]
+    elif bank_type == "HSBC":
+        date_keys = ["date", "txn date"]
+        desc_keys = ["narration", "transaction details", "description", "details"]
+        debit_keys = ["debit", "withdrawal"]
+        credit_keys = ["credit", "deposit"]
+        amount_keys = ["amount", "amt"]
+        type_keys = ["dr/cr", "type"]
+    else:
+        # Generic
+        date_keys = ["date", "txn date", "transaction date", "value dt"]
+        desc_keys = ["narration", "description", "details", "remark", "particular"]
+        debit_keys = ["debit", "withdraw", "withdrawal"]
+        credit_keys = ["credit", "deposit"]
+        amount_keys = ["amount", "amt"]
+        type_keys = ["type", "dr/cr"]
 
     def find_col(keywords):
         for c in cols:
@@ -122,23 +273,18 @@ def _canonicalize_table(df_in):
                 return c
         return None
 
-    date_col = find_col(["date"])
-    desc_col = find_col(["narrat", "remark", "descr", "details", "particular"])
-
-    withdraw_col = find_col(["withdraw", "debit"])
-    deposit_col = find_col(["deposit", "credit"])
-    amount_col = find_col(["amount", "amt"])
-    type_col = find_col(["type"])
+    date_col = find_col(date_keys)
+    desc_col = find_col(desc_keys)
+    withdraw_col = find_col(debit_keys)
+    deposit_col = find_col(credit_keys)
+    amount_col = find_col(amount_keys)
+    type_col = find_col(type_keys)
 
     if date_col is None:
         raise Exception("Missing date column.")
-
     if desc_col is None:
-        # Fallback: second column if we didn't find a better one
-        if len(cols) >= 2:
-            desc_col = cols[1]
-        else:
-            desc_col = cols[0]
+        # fallback: second column if exists, else first
+        desc_col = cols[1] if len(cols) > 1 else cols[0]
 
     def to_num_series(s):
         s = (
@@ -154,46 +300,55 @@ def _canonicalize_table(df_in):
     if deposit_col:
         df[deposit_col] = to_num_series(df[deposit_col]).fillna(0)
     if amount_col:
-        df[amount_col] = to_num_series(df[amount_col])
+        df[amount_col] = to_num_series(df[amount_col]).fillna(0)
 
-    # Decide signed_amount
-    if withdraw_col or deposit_col:
-        wd = df[withdraw_col] if withdraw_col else 0
-        dep = df[deposit_col] if deposit_col else 0
-        signed = dep - wd
+    # Build signed_amount
+    signed_amount = None
+
+    # Case 1: separate debit & credit
+    if withdraw_col and deposit_col:
+        debit_vals = df[withdraw_col]
+        credit_vals = df[deposit_col]
+        signed_amount = credit_vals - debit_vals
+
+    # Case 2: single amount + DR/CR type
+    elif amount_col and type_col:
+        amt = df[amount_col]
+        t = df[type_col].astype(str).str.upper()
+        is_credit = t.str.contains("CR")
+        signed_amount = np.where(is_credit, amt, -amt)
+
+    # Case 3: single amount with +/- signs
     elif amount_col:
-        signed = df[amount_col]
-        # If we have a Type column with CR/DR and amount is mostly positive,
-        # use the type to decide the sign.
-        if type_col:
-            type_series = df[type_col].astype(str).str.upper()
-            if signed.dropna().ge(0).mean() > 0.9:
-                signed = signed.where(type_series == "CR", -signed.abs())
+        signed_amount = df[amount_col]
+
     else:
-        raise Exception("Missing amount/debit/credit columns.")
+        raise Exception("Unable to determine amount columns.")
 
-    df_out = pd.DataFrame()
-    df_out["date"] = pd.to_datetime(df[date_col], dayfirst=True, errors="coerce")
-    df_out["description"] = df[desc_col].astype(str)
-    df_out["signed_amount"] = signed
+    out = pd.DataFrame()
+    out["date"] = pd.to_datetime(df[date_col], errors="coerce")
+    out["description"] = df[desc_col].astype(str).str.strip()
+    out["signed_amount"] = pd.to_numeric(signed_amount, errors="coerce")
 
-    df_out = df_out.dropna(subset=["date"])
-    df_out = df_out[df_out["signed_amount"].notna()]
-    df_out = df_out.sort_values("date")
+    # Drop rows with no date or no amount
+    out = out.dropna(subset=["date", "signed_amount"])
+    out = out.sort_values("date").reset_index(drop=True)
+    return out
 
-    return df_out[["date", "description", "signed_amount"]]
+
+# ---------------------------------------------------------------------------
+# PDF PARSER
+# ---------------------------------------------------------------------------
 
 
-# ---------------------------- PDF PARSER ----------------------------
-
-def _parse_pdf(file_bytes):
+def _parse_pdf(file_bytes: bytes, file_name: str) -> pd.DataFrame:
     """
     Generic PDF parser:
     - Extract tables with pdfplumber
-    - For each table, run the same header detection + canonicalization
+    - For each table, run header detection + canonicalization
     - Works for HDFC OpTransactionHistory PDFs and generic Date/Description/Amount/Type PDFs.
     """
-    all_rows = []
+    all_tables = []
 
     with pdfplumber.open(BytesIO(file_bytes)) as pdf:
         for page in pdf.pages:
@@ -202,49 +357,106 @@ def _parse_pdf(file_bytes):
                 df_raw = pd.DataFrame(t)
                 try:
                     df_tbl = _extract_table(df_raw)
-                    core = _canonicalize_table(df_tbl)
-                    all_rows.append(core)
+                    all_tables.append(df_tbl)
                 except Exception:
                     # Ignore tables that don't look like statements
                     continue
 
-    if not all_rows:
-        raise Exception("PDF: Could not parse transaction table.")
+    if not all_tables:
+        raise Exception("No valid tables found in PDF.")
 
-    df_all = pd.concat(all_rows, ignore_index=True)
-    return df_all
+    df_tbl = pd.concat(all_tables, ignore_index=True)
+    bank_type = _predict_bank_template(df_tbl, file_name) or _predict_bank_from_filename(
+        file_name
+    )
+    df = _canonicalize_table(df_tbl, bank_type=bank_type)
+    return df
 
 
-# ---------------------------- CATEGORIES ----------------------------
+# ---------------------------------------------------------------------------
+# CATEGORY DETECTION (ML + FALLBACK)
+# ---------------------------------------------------------------------------
 
-def _detect_category(desc: str) -> str:
+
+def _detect_category_fallback(desc: str) -> str:
+    """
+    Rule-based fallback categoriser when ML model is missing or fails.
+    """
     d = str(desc).lower()
+
     mapping = {
-        "salary": ["salary"],
+        "salary": ["salary", "sal ", "payroll"],
         "rent": ["rent"],
-        "shopping": ["amazon", "flipkart", "myntra"],
-        "food & dining": ["swiggy", "zomato", "restaurant", "dining"],
-        "fuel & transport": ["petrol", "diesel", "hpcl", "bpcl", "shell", "uber", "ola"],
-        "subscriptions": ["netflix", "hotstar", "prime", "spotify"],
         "emi": ["emi", "loan", "instalment", "installment"],
+        "shopping": ["amazon", "flipkart", "myntra"],
+        "food & dining": ["swiggy", "zomato", "restaurant", "hotel", "dining"],
+        "groceries": ["bigbasket", "dmart", "more", "reliance fresh", "grocer"],
+        "fuel & transport": ["petrol", "diesel", "hpcl", "bpcl", "shell", "uber", "ola"],
+        "bills & utilities": ["electricity", "eb bill", "tneb", "water tax"],
+        "mobile & internet": [
+            "airtel",
+            "jio",
+            "vodafone",
+            "idea",
+            "vi ",
+            "postpaid",
+            "prepaid",
+            "broadband",
+            "wifi",
+        ],
+        "upi payment": ["upi/"],
         "medical": ["hospital", "pharmacy", "clinic", "lab"],
-        "mobile & internet": ["airtel", "jio", "vodafone", "idea", "vi", "postpaid", "prepaid", "broadband", "wifi"],
+        "insurance": ["insurance", "premium"],
     }
+
     for cat, keys in mapping.items():
         if any(k in d for k in keys):
             return cat
+
+    # If looks like income
+    if any(k in d for k in ["neft", "rtgs", "imps", "upi", "salary"]):
+        return "income"
+
     return "others"
 
 
-# ---------------------------- FUTURE BLOCK ----------------------------
+def _assign_categories(df: pd.DataFrame) -> pd.Series:
+    """
+    Try ML category model first, then fall back to keyword rules.
+    """
+    model = _get_category_model()
+    desc_series = df["description"].astype(str)
 
-def _build_future_block(df, safe_daily_spend):
+    if model is not None:
+        try:
+            preds = model.predict(desc_series.tolist())
+            return pd.Series(preds, index=df.index).astype(str).str.lower()
+        except Exception:
+            pass
+
+    # Fallback
+    return desc_series.apply(_detect_category_fallback).astype(str).str.lower()
+
+
+# ---------------------------------------------------------------------------
+# FUTURE BLOCK + OPTIONAL SAVINGS MODEL
+# ---------------------------------------------------------------------------
+
+
+def _build_future_block(df: pd.DataFrame, safe_daily_spend: float) -> dict:
+    """
+    Build a small "future outlook" block:
+    - heuristic projected month-end savings
+    - risk level
+    - optionally: ML-predicted savings using savings_model.joblib
+    """
     if df.empty:
         return {
             "predicted_eom_savings": 0.0,
             "predicted_eom_range": [0.0, 0.0],
             "overspend_risk": {"level": "low", "probability": 0.0},
             "risky_categories": [],
+            "ml_predicted_savings": None,
         }
 
     df = df.copy()
@@ -261,103 +473,180 @@ def _build_future_block(df, safe_daily_spend):
             "predicted_eom_range": [0.0, 0.0],
             "overspend_risk": {"level": "low", "probability": 0.0},
             "risky_categories": [],
+            "ml_predicted_savings": None,
         }
 
     last_date = df_current["date"].max()
     days_in_month = calendar.monthrange(last_date.year, last_date.month)[1]
     days_elapsed = last_date.day
+    days_left = max(0, days_in_month - days_elapsed)
 
-    inflow_to_date = df_current[df_current["signed_amount"] > 0]["signed_amount"].sum()
-    outflow_to_date = -df_current[df_current["signed_amount"] < 0]["signed_amount"].sum()
+    inflow_so_far = df_current[df_current["signed_amount"] > 0]["signed_amount"].sum()
+    outflow_so_far = -df_current[df_current["signed_amount"] < 0]["signed_amount"].sum()
+    savings_so_far = inflow_so_far - outflow_so_far
 
-    avg_inflow = inflow_to_date / max(days_elapsed, 1)
-    avg_outflow = outflow_to_date / max(days_elapsed, 1)
+    # Heuristic: assume spend pace continues
+    avg_daily_outflow = outflow_so_far / max(days_elapsed, 1)
+    projected_extra_outflow = avg_daily_outflow * days_left
+    projected_savings = inflow_so_far - (outflow_so_far + projected_extra_outflow)
 
-    predicted_eom = (avg_inflow - avg_outflow) * days_in_month
-    low = predicted_eom * 0.85
-    high = predicted_eom * 1.15
+    low_proj = projected_savings - 0.1 * abs(projected_savings)
+    high_proj = projected_savings + 0.1 * abs(projected_savings)
 
+    # Risk: compare projected daily spend vs safe_daily_spend
+    risk_ratio = 0.0
     if safe_daily_spend > 0:
-        projected_budget_outflow = safe_daily_spend * days_in_month
-        if projected_budget_outflow > 0:
-            ratio = max(
-                0.0,
-                min(1.0, float(outflow_to_date) / float(projected_budget_outflow)),
-            )
-        else:
-            ratio = 0.0
+        risk_ratio = avg_daily_outflow / safe_daily_spend
+
+    if risk_ratio <= 0.8:
+        risk_level = "low"
+        risk_prob = 0.15
+    elif risk_ratio <= 1.2:
+        risk_level = "medium"
+        risk_prob = 0.45
     else:
-        ratio = 0.5
+        risk_level = "high"
+        risk_prob = 0.75
 
-    level = "low" if ratio < 0.33 else "medium" if ratio < 0.66 else "high"
+    # Risky categories (current month top 3 by spend)
+    exp_current = df_current[df_current["signed_amount"] < 0]
+    risky_cats = (
+        exp_current.groupby("category")["signed_amount"]
+        .sum()
+        .abs()
+        .sort_values(ascending=False)
+        .head(3)
+        .reset_index()
+        .to_dict(orient="records")
+    )
 
-    df_current_neg = df_current[df_current["signed_amount"] < 0].copy()
-    df_current_neg["outflow"] = -df_current_neg["signed_amount"]
-    risky = []
+    # Optional ML savings model
+    ml_pred = None
+    model = _get_savings_model()
+    if model is not None:
+        try:
+            # crude split: fixed = rent + emi; variable = others
+            fixed_mask = df_current["category"].str.lower().isin(["rent", "emi"])
+            fixed_expenses = -df_current[
+                (df_current["signed_amount"] < 0) & fixed_mask
+            ]["signed_amount"].sum()
+            variable_expenses = -df_current[
+                (df_current["signed_amount"] < 0) & ~fixed_mask
+            ]["signed_amount"].sum()
+            total_income = df_current[df_current["signed_amount"] > 0][
+                "signed_amount"
+            ].sum()
 
-    if "category" in df_current_neg.columns and not df_current_neg.empty:
-        grp = (
-            df_current_neg.groupby("category")["outflow"]
-            .sum()
-            .sort_values(ascending=False)
-            .head(3)
-        )
-        for cat, val in grp.items():
-            risky.append(
-                {"name": cat, "projected_amount": float(val), "baseline_amount": 0.0}
+            features = np.array(
+                [[float(total_income), float(fixed_expenses), float(variable_expenses)]]
             )
+            ml_pred = float(model.predict(features)[0])
+        except Exception:
+            ml_pred = None
 
     return {
-        "predicted_eom_savings": float(predicted_eom),
-        "predicted_eom_range": [float(low), float(high)],
-        "overspend_risk": {"level": level, "probability": float(ratio)},
-        "risky_categories": risky,
+        "predicted_eom_savings": float(projected_savings),
+        "predicted_eom_range": [float(low_proj), float(high_proj)],
+        "overspend_risk": {"level": risk_level, "probability": float(risk_prob)},
+        "risky_categories": risky_cats,
+        "ml_predicted_savings": ml_pred,
     }
 
 
-# ---------------------------- MAIN ENTRY ----------------------------
+# ---------------------------------------------------------------------------
+# MAIN ENTRYPOINT
+# ---------------------------------------------------------------------------
 
-def analyze_statement(file_bytes, file_name):
+
+def analyze_statement(file_bytes: bytes, file_name: str) -> dict:
+    """
+    Main function called by the backend.
+    Returns a JSON-serialisable dict with:
+      - inflow, outflow, net_savings
+      - this_month (savings, prev_savings, mom_change)
+      - safe_daily_spend
+      - upi, emi
+      - monthly_savings, category_summary
+      - cleaned_csv (for download)
+      - future_block
+    """
     name = (file_name or "").lower()
 
     if name.endswith(".pdf"):
-        df = _parse_pdf(file_bytes)
+        df = _parse_pdf(file_bytes, file_name)
+        bank_type = _predict_bank_from_filename(file_name)
     else:
         df_raw = _load_raw(file_bytes, file_name)
+        bank_type = _predict_bank_template(df_raw, file_name)
         df_tbl = _extract_table(df_raw)
-        df = _canonicalize_table(df_tbl)
+        df = _canonicalize_table(df_tbl, bank_type=bank_type)
 
     # Categories & month
-    df["category"] = df["description"].apply(_detect_category)
+    df["category"] = _assign_categories(df)
     df["month"] = df["date"].dt.to_period("M")
 
     inflow = df[df["signed_amount"] > 0]["signed_amount"].sum()
     outflow = -df[df["signed_amount"] < 0]["signed_amount"].sum()
     net_savings = inflow - outflow
 
-    monthly = df.groupby("month")["signed_amount"].sum().reset_index()
-    monthly["month"] = monthly["month"].astype(str)
+    if df["month"].nunique() == 0:
+        raise Exception("No valid transactions found.")
 
     latest_month = df["month"].max()
-    latest_month_str = str(latest_month)
+    df_latest = df[df["month"] == latest_month]
 
-    this_month_df = df[df["month"] == latest_month]
-    this_month_savings = this_month_df["signed_amount"].sum()
+    inflow_latest = df_latest[df_latest["signed_amount"] > 0]["signed_amount"].sum()
+    outflow_latest = -df_latest[df_latest["signed_amount"] < 0]["signed_amount"].sum()
+    this_month_savings = inflow_latest - outflow_latest
 
-    prev_month = latest_month - 1
-    if prev_month in df["month"].unique():
-        prev_savings = df[df["month"] == prev_month]["signed_amount"].sum()
-        mom_change = this_month_savings - prev_savings
+    # previous month
+    prev_months = sorted(df["month"].unique())
+    prev_savings = 0.0
+    if len(prev_months) >= 2:
+        prev_month = prev_months[-2]
+        df_prev = df[df["month"] == prev_month]
+        prev_in = df_prev[df_prev["signed_amount"] > 0]["signed_amount"].sum()
+        prev_out = -df_prev[df_prev["signed_amount"] < 0]["signed_amount"].sum()
+        prev_savings = prev_in - prev_out
+
+    if prev_savings != 0:
+        mom_change = (this_month_savings - prev_savings) / abs(prev_savings) * 100.0
     else:
-        prev_savings = 0.0
         mom_change = 0.0
 
-    # UPI info
-    upi_mask = df["description"].str.contains("upi", case=False, na=False)
-    upi_df = df[upi_mask & (df["signed_amount"] < 0)]
-    upi_total = -upi_df["signed_amount"].sum()
+    # Safe daily spend: assume full savings spread across month days
+    if not df_latest.empty:
+        last_date = df_latest["date"].max()
+        days_in_month = calendar.monthrange(last_date.year, last_date.month)[1]
+    else:
+        any_date = df["date"].max()
+        days_in_month = calendar.monthrange(any_date.year, any_date.month)[1]
 
-    upi_month_df = upi_df[upi_df["month"] == latest_month]
+    safe_daily = max(0.0, float(this_month_savings)) / float(days_in_month)
+
+    # Monthly savings summary
+    def _agg_month(sub: pd.DataFrame) -> pd.Series:
+        inflow_m = sub[sub["signed_amount"] > 0]["signed_amount"].sum()
+        outflow_m = -sub[sub["signed_amount"] < 0]["signed_amount"].sum()
+        savings_m = inflow_m - outflow_m
+        return pd.Series(
+            {
+                "month": str(sub.name),
+                "inflow": float(inflow_m),
+                "outflow": float(outflow_m),
+                "savings": float(savings_m),
+            }
+        )
+
+    monthly = df.groupby("month").apply(_agg_month).reset_index(drop=True)
+
+    # UPI info (expenses only)
+    upi_df = df[df["description"].str.contains("upi", case=False, na=False)]
+    upi_df_exp = upi_df[upi_df["signed_amount"] < 0]
+
+    upi_total = -upi_df_exp["signed_amount"].sum()
+
+    upi_month_df = upi_df_exp[upi_df_exp["month"] == latest_month]
     upi_month_total = -upi_month_df["signed_amount"].sum()
 
     if not upi_month_df.empty:
@@ -372,13 +661,13 @@ def analyze_statement(file_bytes, file_name):
         top_upi_handle = None
 
     # EMI info
-    emi_df = df[df["category"] == "emi"]
+    emi_df = df[df["category"].str.lower() == "emi"]
     emi_month_df = emi_df[emi_df["month"] == latest_month]
 
     emi_load = -emi_month_df["signed_amount"].sum()
     emi_months = emi_df["month"].nunique()
 
-    # Category summary
+    # Category summary (expenses only)
     cat_summary = (
         df[df["signed_amount"] < 0]
         .groupby("category")["signed_amount"]
@@ -388,26 +677,23 @@ def analyze_statement(file_bytes, file_name):
         .sort_values("signed_amount", ascending=False)
     )
 
-    safe_daily = max(0, this_month_savings) / 30
-    future_block = _build_future_block(df, safe_daily)
+    future_block = _build_future_block(df, safe_daily_spend=safe_daily)
 
     cleaned_export = df[["date", "description", "signed_amount", "category"]].copy()
     cleaned_export["date"] = cleaned_export["date"].astype(str)
     csv_output = cleaned_export.to_csv(index=False)
 
     return {
-        "summary": {
-            "inflow": float(inflow),
-            "outflow": float(outflow),
-            "net_savings": float(net_savings),
-            "this_month": {
-                "month": latest_month_str,
-                "savings": float(this_month_savings),
-                "prev_savings": float(prev_savings),
-                "mom_change": float(mom_change),
-            },
-            "safe_daily_spend": float(safe_daily),
+        "inflow": float(inflow),
+        "outflow": float(outflow),
+        "net_savings": float(net_savings),
+        "this_month": {
+            "month": str(latest_month),
+            "savings": float(this_month_savings),
+            "prev_savings": float(prev_savings),
+            "mom_change": float(mom_change),
         },
+        "safe_daily_spend": float(safe_daily),
         "upi": {
             "this_month": float(upi_month_total),
             "top_handle": top_upi_handle,
