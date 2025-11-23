@@ -684,6 +684,7 @@ def analyze_statement(file_bytes: bytes, file_name: str) -> dict:
     csv_output = cleaned_export.to_csv(index=False)
 
     return {
+    "summary": {
         "inflow": float(inflow),
         "outflow": float(outflow),
         "net_savings": float(net_savings),
@@ -694,17 +695,18 @@ def analyze_statement(file_bytes: bytes, file_name: str) -> dict:
             "mom_change": float(mom_change),
         },
         "safe_daily_spend": float(safe_daily),
-        "upi": {
-            "this_month": float(upi_month_total),
-            "top_handle": top_upi_handle,
-            "total_upi": float(upi_total),
-        },
-        "emi": {
-            "this_month": float(emi_load),
-            "months_tracked": int(emi_months),
-        },
-        "monthly_savings": monthly.to_dict(orient="records"),
-        "category_summary": cat_summary.to_dict(orient="records"),
-        "cleaned_csv": csv_output,
-        "future_block": future_block,
-    }
+    },
+    "upi": {
+        "this_month": float(upi_month_total),
+        "top_handle": top_upi_handle,
+        "total_upi": float(upi_total),
+    },
+    "emi": {
+        "this_month": float(emi_load),
+        "months_tracked": int(emi_months),
+    },
+    "monthly_savings": monthly.to_dict(orient="records"),
+    "category_summary": cat_summary.to_dict(orient="records"),
+    "cleaned_csv": csv_output,
+    "future_block": future_block,
+}
