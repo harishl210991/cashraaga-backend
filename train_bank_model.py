@@ -7,8 +7,8 @@ Usage:
                                --output bank_template_model.joblib
 
 Expected CSV columns:
-    - text : concatenated header + few rows from a statement
-    - bank : bank label (e.g. ICICI, HDFC, HSBC, SBI, GENERIC)
+    - text : concatenated header + a few rows from a statement
+    - bank : bank label (e.g. ICICI, HDFC, HSBC, HDFC, GENERIC)
 """
 
 import argparse
@@ -26,6 +26,9 @@ DEFAULT_OUTPUT = "bank_template_model.joblib"
 
 
 def train_bank_model(input_csv: str, output_path: str = DEFAULT_OUTPUT) -> None:
+    # ------------------------------------------------------------------
+    # 1. LOAD DATA
+    # ------------------------------------------------------------------
     df = pd.read_csv(input_csv)
     if "text" not in df.columns or "bank" not in df.columns:
         raise ValueError(
@@ -45,21 +48,40 @@ def train_bank_model(input_csv: str, output_path: str = DEFAULT_OUTPUT) -> None:
     y = df["bank"]
 
     if y.nunique() < 2:
-        raise ValueError("Need at least 2 different banks to train a model.")
-# Use stratify only if every class has ≥2 samples
-value_counts = y.value_counts()
-if (value_counts >= 2).all():
-    stratify_y = y
-else:
-    stratify_y = None  # disable stratification
+        raise ValueError(
+            "Need at least 2 different bank labels to train a model. "
+            f"Currently found: {y.unique().tolist()}"
+        )
 
-X_train, X_test, y_train, y_test = train_test_split(
-    X,
-    y,
-    test_size=0.2,
-    random_state=42,
-    stratify=stratify_y,
-)
+    # ------------------------------------------------------------------
+    # 2. HANDLE SMALL CLASS COUNTS (FIX FOR YOUR ERROR)
+    # ------------------------------------------------------------------
+    value_counts = y.value_counts()
+    print("[train_bank_model] Class counts:")
+    print(value_counts)
+
+    # We only use stratify if every class has at least 2 samples
+    if (value_counts >= 2).all():
+        stratify_y = y
+        print("[train_bank_model] Using stratified train/test split.")
+    else:
+        stratify_y = None
+        print(
+            "[train_bank_model] Some classes have < 2 samples. "
+            "Disabling stratified split (this is normal for tiny datasets)."
+        )
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X,
+        y,
+        test_size=0.2,
+        random_state=42,
+        stratify=stratify_y,
+    )
+
+    # ------------------------------------------------------------------
+    # 3. BUILD PIPELINE: TF-IDF + LOGISTIC REGRESSION
+    # ------------------------------------------------------------------
     pipe = Pipeline(
         [
             (
@@ -84,13 +106,24 @@ X_train, X_test, y_train, y_test = train_test_split(
     print("[train_bank_model] Training model...")
     pipe.fit(X_train, y_train)
 
-    # Evaluation
-    y_pred = pipe.predict(X_test)
-    acc = accuracy_score(y_test, y_pred)
-    print(f"[train_bank_model] Validation accuracy: {acc:.3f}")
-    print("[train_bank_model] Classification report:")
-    print(classification_report(y_test, y_pred))
+    # ------------------------------------------------------------------
+    # 4. EVALUATE
+    # ------------------------------------------------------------------
+    if len(X_test) > 0:
+        y_pred = pipe.predict(X_test)
+        acc = accuracy_score(y_test, y_pred)
+        print(f"[train_bank_model] Validation accuracy: {acc:.3f}")
+        print("[train_bank_model] Classification report:")
+        print(classification_report(y_test, y_pred))
+    else:
+        print(
+            "[train_bank_model] No test samples (very small dataset). "
+            "Skipping evaluation."
+        )
 
+    # ------------------------------------------------------------------
+    # 5. SAVE MODEL
+    # ------------------------------------------------------------------
     joblib.dump(pipe, output_path)
     print(f"[train_bank_model] Saved model to {output_path}")
 
