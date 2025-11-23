@@ -46,17 +46,20 @@ def train_bank_model(input_csv: str, output_path: str = DEFAULT_OUTPUT) -> None:
 
     if y.nunique() < 2:
         raise ValueError("Need at least 2 different banks to train a model.")
+# Use stratify only if every class has ≥2 samples
+value_counts = y.value_counts()
+if (value_counts >= 2).all():
+    stratify_y = y
+else:
+    stratify_y = None  # disable stratification
 
-    stratify_y = y if y.nunique() > 1 else None
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X,
-        y,
-        test_size=0.2,
-        random_state=42,
-        stratify=stratify_y,
-    )
-
+X_train, X_test, y_train, y_test = train_test_split(
+    X,
+    y,
+    test_size=0.2,
+    random_state=42,
+    stratify=stratify_y,
+)
     pipe = Pipeline(
         [
             (
