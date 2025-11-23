@@ -9,10 +9,6 @@ Usage:
 Expected CSV columns:
     - description : transaction narration (string)
     - category    : label (e.g. Salary, Rent, EMI, Groceries, etc.)
-
-Important:
-    Make sure to include HSBC SALARY-like rows and label them as "Salary"
-    so the model learns those patterns even without the word "salary".
 """
 
 import argparse
@@ -32,12 +28,19 @@ DEFAULT_OUTPUT = "category_model.joblib"
 def train_category_model(input_csv: str, output_path: str = DEFAULT_OUTPUT) -> None:
     # Load data
     df = pd.read_csv(input_csv)
-    if "description" not in df.columns or "category" not in df.columns:
-        raise ValueError(
-            "Input CSV must contain columns: 'description' and 'category'. "
-            f"Found: {list(df.columns)}"
-        )
+    # normalise column names
+    cols = {c.lower(): c for c in df.columns}
+    if "description" in cols:
+        desc_col = cols["description"]
+    elif "narration" in cols:
+        desc_col = cols["narration"]
+    else:
+        raise ValueError("Input CSV must have a 'description' (or 'Description') column.")
+    if "category" not in {c.lower() for c in df.columns}:
+        raise ValueError("Input CSV must have a 'category' column.")
 
+    # Align to 'description' / 'category'
+    df = df.rename(columns={desc_col: "description"})
     df = df.dropna(subset=["description", "category"]).copy()
     df["description"] = df["description"].astype(str)
     df["category"] = df["category"].astype(str)
@@ -49,11 +52,20 @@ def train_category_model(input_csv: str, output_path: str = DEFAULT_OUTPUT) -> N
     X = df["description"]
     y = df["category"]
 
-    # If only one class exists, we cannot train a proper classifier
     if y.nunique() < 2:
         raise ValueError("Need at least 2 different categories to train a model.")
 
-    stratify_y = y if y.nunique() > 1 else None
+    # Use stratify only if all classes have ≥2 samples
+    value_counts = y.value_counts()
+    if (value_counts >= 2).all():
+        stratify_y = y
+        print("[train_categories] Using stratified train/test split.")
+    else:
+        stratify_y = None
+        print(
+            "[train_categories] Some categories have < 2 samples. "
+            "Disabling stratified split (tiny dataset)."
+        )
 
     X_train, X_test, y_train, y_test = train_test_split(
         X,
@@ -63,13 +75,13 @@ def train_category_model(input_csv: str, output_path: str = DEFAULT_OUTPUT) -> N
         stratify=stratify_y,
     )
 
-    pipe = Pipeline(
+    model = Pipeline(
         [
             (
                 "tfidf",
                 TfidfVectorizer(
                     ngram_range=(1, 2),
-                    min_df=2,
+                    min_df=1,
                     max_features=20000,
                 ),
             ),
@@ -78,24 +90,24 @@ def train_category_model(input_csv: str, output_path: str = DEFAULT_OUTPUT) -> N
                 LogisticRegression(
                     max_iter=400,
                     n_jobs=-1,
-                    multi_class="auto",
                 ),
             ),
         ]
     )
 
     print("[train_categories] Training model...")
-    pipe.fit(X_train, y_train)
+    model.fit(X_train, y_train)
 
-    # Evaluation
-    y_pred = pipe.predict(X_test)
-    acc = accuracy_score(y_test, y_pred)
-    print(f"[train_categories] Validation accuracy: {acc:.3f}")
-    print("[train_categories] Classification report:")
-    print(classification_report(y_test, y_pred))
+    if len(X_test) > 0:
+        y_pred = model.predict(X_test)
+        acc = accuracy_score(y_test, y_pred)
+        print(f"[train_categories] Validation accuracy: {acc:.3f}")
+        print("[train_categories] Classification report:")
+        print(classification_report(y_test, y_pred))
+    else:
+        print("[train_categories] No test set (very small dataset). Skipping eval.")
 
-    # Save
-    joblib.dump(pipe, output_path)
+    joblib.dump(model, output_path)
     print(f"[train_categories] Saved model to {output_path}")
 
 
