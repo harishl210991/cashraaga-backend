@@ -1,0 +1,8 @@
+text,bank
+"Date,Description,Amount,Type","GENERIC"
+"Date,Description,Amount,Type
+01-01-2025,Salary Credit XYZ Pvt Ltd,75000,CR
+02-01-2025,ATM Withdrawal,-2000,DR","GENERIC"
+"Date,Narration,Chq./Ref.No.,Withdrawal Amt.,Deposit Amt.,Closing Balance","HDFC"
+"Value Date,Transaction Remarks,Withdrawal Amount (INR),Deposit Amount (INR),Balance (INR)","ICICI"
+"Date,Transaction Details,Withdrawals (INR),Deposits (INR),Balance (INR)","HSBC"
